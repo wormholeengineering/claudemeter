@@ -1,0 +1,28 @@
+# ── ESP32-C3 target ───────────────────────────────────────────────
+CONFIG_IDF_TARGET="esp32c3"
+
+# ── Partição customizada (factory 1.94 MB para caber LVGL) ────────
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x8000
+
+# ── WiFi ──────────────────────────────────────────────────────────
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n
+
+# ── LVGL ─────────────────────────────────────────────────────────
+# Usa Kconfig em vez de lv_conf.h
+CONFIG_LV_CONF_SKIP=y
+CONFIG_LV_COLOR_DEPTH=16
+# Fontes embutidas
+CONFIG_LV_FONT_MONTSERRAT_12=y
+CONFIG_LV_FONT_MONTSERRAT_16=y
+CONFIG_LV_FONT_MONTSERRAT_8=y
+# Tema dark
+CONFIG_LV_USE_THEME_DEFAULT=y
+# Widgets usados
+CONFIG_LV_USE_BAR=y
+CONFIG_LV_USE_LABEL=y
+CONFIG_LV_USE_OBJ=y
+
+# ── Logs ──────────────────────────────────────────────────────────
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y

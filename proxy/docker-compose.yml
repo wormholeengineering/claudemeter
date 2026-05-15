@@ -1,0 +1,18 @@
+services:
+  claudemeter:
+    build: .
+    container_name: claudemeter
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DATA_DIR=/data
+    volumes:
+      # Cookies persistidos — o container não perde a sessão ao reiniciar
+      - claudemeter_data:/data
+
+volumes:
+  claudemeter_data:

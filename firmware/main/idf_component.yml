@@ -1,0 +1,9 @@
+## IDF Component Manager — dependências do ClaudeMeter
+dependencies:
+  idf: ">=5.1.0"
+
+  lvgl/lvgl:
+    version: "^9.1.0"
+
+  espressif/esp_lvgl_port:
+    version: "^2.4.0"
