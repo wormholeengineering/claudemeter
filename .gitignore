@@ -10,5 +10,4 @@ firmware/build_log.txt
 firmware/dependencies.lock
 
 # ── Editor ────────────────────────────────────────────────────────
-.vscode/
 *.swp
