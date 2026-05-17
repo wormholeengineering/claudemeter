@@ -10,6 +10,7 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - DATA_DIR=/data
+      - TZ=America/Cuiaba
     volumes:
       # Cookies persistidos — o container não perde a sessão ao reiniciar
       - claudemeter_data:/data

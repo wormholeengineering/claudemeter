@@ -1,13 +1,9 @@
 /*
  * ClaudeMeter — ESP-IDF 5.x + LVGL v9
- * ESP32-C3 Super Mini + ST7735 1.8" SPI (128×160 portrait)
+ * ESP32-C3 Super Mini + ST7735 1.8" SPI (160×128 landscape)
  *
- * Exibe uso da API Claude: sessão 5h, semanal, opus, saldo extra.
+ * Layout: arc gauge sessão (esq), arc gauge semanal + saldo extra (dir)
  * Dados via proxy HTTP local (ver /proxy/server.py).
- *
- * Build:
- *   idf.py set-target esp32c3
- *   idf.py build flash monitor
  */
 
 #include <cstdio>
@@ -40,21 +36,32 @@
 #define REFRESH_SEC    60
 
 // ─── PINOS ─────────────────────────────────────────────────────────
-// ESP32-C3 Super Mini — confirme com seu hardware
-#define GPIO_MOSI  6    // SPI MOSI
-#define GPIO_SCLK  4    // SPI CLK
-#define GPIO_CS   21    // TFT CS
-#define GPIO_DC    1    // TFT DC (data/command)
-#define GPIO_RST   3    // TFT RST
+#define GPIO_MOSI  6
+#define GPIO_SCLK  4
+#define GPIO_CS   21
+#define GPIO_DC    1
+#define GPIO_RST   3
 
-// ─── DISPLAY ────────────────────────────────────────────────────────
+// ─── DISPLAY (landscape) ────────────────────────────────────────────
 #define LCD_HOST        SPI2_HOST
-#define LCD_FREQ_HZ     (26 * 1000 * 1000)   // 26 MHz — seguro para ST7735
-#define LCD_W           128
-#define LCD_H           160
-// Offsets do GREENTAB para conversão de coordenadas
-#define ST7735_X_OFFSET  2
-#define ST7735_Y_OFFSET  1
+#define LCD_FREQ_HZ     (26 * 1000 * 1000)
+#define LCD_W           160
+#define LCD_H           128
+// Offsets GREENTAB em landscape
+#define ST7735_X_OFFSET  1
+#define ST7735_Y_OFFSET  2
+
+// ─── CORES ──────────────────────────────────────────────────────────
+#define C_BG        0x141414   // fundo
+#define C_TOPBAR    0x1A1A1A   // barra topo
+#define C_DIV       0x2A2A2A   // divisor
+#define C_SESSION   0xE07040   // arco sessão (coral)
+#define C_WEEKLY    0xA0A0A0   // arco semanal (cinza)
+#define C_ARC_BG    0x2A2A2A   // trilho do arco
+#define C_GREEN     0x26D24E   // dot heartbeat + saldo extra
+#define C_LABEL     0x606060   // labels "SESSAO", "SEMANAL", "EXTRA"
+#define C_TEXT      0xC8C8C8   // texto secundário (tempo reset)
+#define C_WHITE     0xE8E8E8   // texto principal
 
 static const char *TAG = "claudemeter";
 
@@ -62,13 +69,15 @@ static const char *TAG = "claudemeter";
 typedef struct {
     float session_pct;
     float weekly_pct;
-    float opus_pct;
     float extra_balance;
-    int   reset_secs;
+    int   session_reset_secs;
+    int   weekly_reset_secs;
+    char  weekly_reset_day[4];   // "MON".."SUN"
+    char  weekly_reset_time[6];  // "HH:MM" Brasília local
     bool  valid;
 } claude_usage_t;
 
-static claude_usage_t g_usage = {-1, -1, -1, -1, -1, false};
+static claude_usage_t g_usage = {0, 0, -1, -1, -1, "", "", false};
 static SemaphoreHandle_t g_usage_lock;
 
 // ─── WiFi ───────────────────────────────────────────────────────────
@@ -78,115 +87,114 @@ static EventGroupHandle_t g_wifi_events;
 static bool g_wifi_ok = false;
 
 // ─── LVGL globals ───────────────────────────────────────────────────
-static lv_display_t  *g_disp  = nullptr;
+static lv_display_t      *g_disp = nullptr;
 static spi_device_handle_t g_spi;
 
 // ─── Widgets ────────────────────────────────────────────────────────
-static lv_obj_t *g_bar_s, *g_bar_w, *g_bar_o;
-static lv_obj_t *g_lbl_s_pct, *g_lbl_w_pct, *g_lbl_o_pct;
-static lv_obj_t *g_lbl_s_reset;
+static lv_obj_t *g_arc_session;
+static lv_obj_t *g_lbl_session_pct;
+static lv_obj_t *g_lbl_session_label;
+static lv_obj_t *g_lbl_session_reset;
+
+static lv_obj_t *g_arc_weekly;
+static lv_obj_t *g_lbl_weekly_pct;
+static lv_obj_t *g_lbl_weekly_reset;
+
 static lv_obj_t *g_lbl_balance;
-static lv_obj_t *g_lbl_status;
-static lv_obj_t *g_dot_wifi;
+
+static lv_obj_t *g_dot_heartbeat;
+static lv_obj_t *g_wifi_bars[3];
 
 // ════════════════════ ST7735 DRIVER ════════════════════════════════
 
-// Callback: seta pino DC antes de cada transação SPI
-// t->user = 0 → comando, 1 → dados
 static void IRAM_ATTR spi_pre_transfer(spi_transaction_t *t) {
     gpio_set_level((gpio_num_t)GPIO_DC, (int)(intptr_t)t->user);
 }
 
 static void st7735_cmd(uint8_t cmd) {
     spi_transaction_t t = {};
-    t.length    = 8;
+    t.length     = 8;
     t.tx_data[0] = cmd;
-    t.user       = (void *)0;   // DC = 0 (comando)
+    t.user       = (void *)0;
     t.flags      = SPI_TRANS_USE_TXDATA;
     spi_device_polling_transmit(g_spi, &t);
 }
 
 static void st7735_data(const uint8_t *data, size_t len) {
-    if (len == 0) return;
+    if (!len) return;
     spi_transaction_t t = {};
     t.length    = len * 8;
     t.tx_buffer = data;
-    t.user       = (void *)1;   // DC = 1 (dados)
+    t.user      = (void *)1;
     spi_device_polling_transmit(g_spi, &t);
 }
 
 static void st7735_data1(uint8_t d) { st7735_data(&d, 1); }
 
 static void st7735_set_window(int x0, int y0, int x1, int y1) {
-    st7735_cmd(0x2A);  // CASET
-    uint8_t cx[4] = { 0, (uint8_t)x0, 0, (uint8_t)x1 };
+    st7735_cmd(0x2A);
+    uint8_t cx[4] = {0, (uint8_t)x0, 0, (uint8_t)x1};
     st7735_data(cx, 4);
-
-    st7735_cmd(0x2B);  // RASET
-    uint8_t cy[4] = { 0, (uint8_t)y0, 0, (uint8_t)y1 };
+    st7735_cmd(0x2B);
+    uint8_t cy[4] = {0, (uint8_t)y0, 0, (uint8_t)y1};
     st7735_data(cy, 4);
-
-    st7735_cmd(0x2C);  // RAMWR
+    st7735_cmd(0x2C);
 }
 
 static void st7735_init() {
-    // Reset por hardware
     gpio_set_level((gpio_num_t)GPIO_RST, 0);
     vTaskDelay(pdMS_TO_TICKS(20));
     gpio_set_level((gpio_num_t)GPIO_RST, 1);
     vTaskDelay(pdMS_TO_TICKS(150));
 
-    st7735_cmd(0x01);  vTaskDelay(pdMS_TO_TICKS(150)); // SWRESET
-    st7735_cmd(0x11);  vTaskDelay(pdMS_TO_TICKS(255)); // SLPOUT
+    st7735_cmd(0x01); vTaskDelay(pdMS_TO_TICKS(150));  // SWRESET
+    st7735_cmd(0x11); vTaskDelay(pdMS_TO_TICKS(255));  // SLPOUT
 
     // Frame rate
     st7735_cmd(0xB1); st7735_data1(0x01); st7735_data1(0x2C); st7735_data1(0x2D);
     st7735_cmd(0xB2); st7735_data1(0x01); st7735_data1(0x2C); st7735_data1(0x2D);
     st7735_cmd(0xB3);
-    for (int i = 0; i < 6; i++) st7735_data1(i < 3 ? (i == 0 ? 0x01 : (i==1?0x2C:0x2D))
-                                                     : (i == 3 ? 0x01 : (i==4?0x2C:0x2D)));
+    for (int i = 0; i < 6; i++)
+        st7735_data1(i < 3 ? (i==0?0x01:i==1?0x2C:0x2D) : (i==3?0x01:i==4?0x2C:0x2D));
 
-    st7735_cmd(0xB4); st7735_data1(0x07);  // INVCTR
+    st7735_cmd(0xB4); st7735_data1(0x07);
 
-    // Power control
     st7735_cmd(0xC0); st7735_data1(0xA2); st7735_data1(0x02); st7735_data1(0x84);
     st7735_cmd(0xC1); st7735_data1(0xC5);
     st7735_cmd(0xC2); st7735_data1(0x0A); st7735_data1(0x00);
     st7735_cmd(0xC3); st7735_data1(0x8A); st7735_data1(0x2A);
     st7735_cmd(0xC4); st7735_data1(0x8A); st7735_data1(0xEE);
-    st7735_cmd(0xC5); st7735_data1(0x0E);  // VMCTR1
+    st7735_cmd(0xC5); st7735_data1(0x0E);
 
     st7735_cmd(0x20);  // INVOFF
 
-    // Orientação retrato + ordem RGB
-    st7735_cmd(0x36); st7735_data1(0x08);  // MADCTL (portrait, RGB)
+    // Landscape: MX+MV=landscape, BGR=0 (0x68 tinha BGR=1 que invertia R↔B)
+    st7735_cmd(0x36); st7735_data1(0x60);
     st7735_cmd(0x3A); st7735_data1(0x05);  // COLMOD 16-bit
 
-    // Área GREENTAB: x offset=2, y offset=1
+    // Área GREENTAB em landscape (x offset=1, y offset=2)
     st7735_cmd(0x2A);
     { uint8_t d[] = {0x00, ST7735_X_OFFSET, 0x00, LCD_W - 1 + ST7735_X_OFFSET}; st7735_data(d, 4); }
     st7735_cmd(0x2B);
     { uint8_t d[] = {0x00, ST7735_Y_OFFSET, 0x00, LCD_H - 1 + ST7735_Y_OFFSET}; st7735_data(d, 4); }
 
-    // Gamma positivo
+    // Gamma
     st7735_cmd(0xE0);
     { uint8_t g[] = {0x0F,0x1A,0x0F,0x18,0x2F,0x28,0x20,0x22,
                      0x1F,0x1B,0x23,0x37,0x00,0x07,0x02,0x10};
       st7735_data(g, 16); }
-    // Gamma negativo
     st7735_cmd(0xE1);
     { uint8_t g[] = {0x0F,0x1B,0x0F,0x17,0x33,0x2C,0x29,0x2E,
                      0x30,0x30,0x39,0x3F,0x00,0x07,0x03,0x10};
       st7735_data(g, 16); }
 
-    st7735_cmd(0x13);  vTaskDelay(pdMS_TO_TICKS(10));  // NORON
-    st7735_cmd(0x29);  vTaskDelay(pdMS_TO_TICKS(100)); // DISPON
+    st7735_cmd(0x13); vTaskDelay(pdMS_TO_TICKS(10));
+    st7735_cmd(0x29); vTaskDelay(pdMS_TO_TICKS(100));
 }
 
-// ════════════════════ LVGL FLUSH CALLBACK ══════════════════════════
+// ════════════════════ LVGL FLUSH ════════════════════════════════════
 
 static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
-    // Aplica offsets do GREENTAB
     int x0 = area->x1 + ST7735_X_OFFSET;
     int y0 = area->y1 + ST7735_Y_OFFSET;
     int x1 = area->x2 + ST7735_X_OFFSET;
@@ -194,18 +202,17 @@ static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px
 
     st7735_set_window(x0, y0, x1, y1);
 
-    // Envia pixels (LVGL com LV_COLOR_16_SWAP já entrega bytes na ordem correta)
     size_t len = (size_t)(x1 - x0 + 1) * (size_t)(y1 - y0 + 1) * 2;
     spi_transaction_t t = {};
     t.length    = len * 8;
     t.tx_buffer = px_map;
-    t.user       = (void *)1;   // DC = dados
+    t.user      = (void *)1;
     spi_device_polling_transmit(g_spi, &t);
 
     lv_display_flush_ready(disp);
 }
 
-// ════════════════════ WiFi ═════════════════════════════════════════
+// ════════════════════ WiFi ══════════════════════════════════════════
 
 static void wifi_event_handler(void *arg, esp_event_base_t base,
                                int32_t id, void *data) {
@@ -214,13 +221,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         g_wifi_ok = false;
         xEventGroupSetBits(g_wifi_events, WIFI_FAIL_BIT);
-        ESP_LOGW(TAG, "WiFi desconectado — reconectando...");
         vTaskDelay(pdMS_TO_TICKS(3000));
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         g_wifi_ok = true;
         xEventGroupSetBits(g_wifi_events, WIFI_CONNECTED_BIT);
-        ESP_LOGI(TAG, "WiFi conectado");
     }
 }
 
@@ -242,13 +247,12 @@ static void wifi_init() {
     wifi_config_t wcfg = {};
     strncpy((char*)wcfg.sta.ssid,     WIFI_SSID, sizeof(wcfg.sta.ssid) - 1);
     strncpy((char*)wcfg.sta.password, WIFI_PASS,  sizeof(wcfg.sta.password) - 1);
-
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wcfg));
     ESP_ERROR_CHECK(esp_wifi_start());
 }
 
-// ════════════════════ HTTP FETCH ═══════════════════════════════════
+// ════════════════════ HTTP FETCH ════════════════════════════════════
 
 #define HTTP_BUF_SIZE 512
 static char g_http_buf[HTTP_BUF_SIZE];
@@ -257,8 +261,8 @@ static int  g_http_len = 0;
 static esp_err_t http_event_handler(esp_http_client_event_t *evt) {
     if (evt->event_id == HTTP_EVENT_ON_DATA) {
         int room = HTTP_BUF_SIZE - g_http_len - 1;
-        if (room > 0) {
-            int copy = evt->data_len < room ? evt->data_len : room;
+        int copy = (evt->data_len < room) ? evt->data_len : room;
+        if (copy > 0) {
             memcpy(g_http_buf + g_http_len, evt->data, copy);
             g_http_len += copy;
         }
@@ -266,14 +270,22 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt) {
     return ESP_OK;
 }
 
+// Formata segundos como "2h 14m" ou "45m"
+static void fmt_reset(char *buf, size_t sz, int secs) {
+    if (secs <= 0) { snprintf(buf, sz, "--"); return; }
+    int h = secs / 3600, m = (secs % 3600) / 60;
+    if (h > 0) snprintf(buf, sz, "%dh %02dm", h, m);
+    else        snprintf(buf, sz, "%dm", m);
+}
+
 static bool fetch_usage() {
     g_http_len = 0;
     memset(g_http_buf, 0, sizeof(g_http_buf));
 
     esp_http_client_config_t cfg = {};
-    cfg.url             = PROXY_URL;
-    cfg.timeout_ms      = 8000;
-    cfg.event_handler   = http_event_handler;
+    cfg.url           = PROXY_URL;
+    cfg.timeout_ms    = 8000;
+    cfg.event_handler = http_event_handler;
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) return false;
@@ -282,288 +294,296 @@ static bool fetch_usage() {
     int status    = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
 
-    if (err != ESP_OK || status != 200) {
-        ESP_LOGW(TAG, "HTTP erro: %s (status %d)", esp_err_to_name(err), status);
-        return false;
-    }
+    if (err != ESP_OK || status != 200) return false;
 
     cJSON *root = cJSON_ParseWithLength(g_http_buf, g_http_len);
-    if (!root) {
-        ESP_LOGW(TAG, "JSON inválido");
-        return false;
-    }
+    if (!root) return false;
+
+    auto f = [&](const char *k, float fb) -> float {
+        cJSON *item = cJSON_GetObjectItemCaseSensitive(root, k);
+        return (item && cJSON_IsNumber(item)) ? (float)item->valuedouble : fb;
+    };
 
     if (xSemaphoreTake(g_usage_lock, pdMS_TO_TICKS(500)) == pdTRUE) {
-        auto f = [&](const char *k, float fallback) -> float {
-            cJSON *item = cJSON_GetObjectItemCaseSensitive(root, k);
-            return (item && cJSON_IsNumber(item)) ? (float)item->valuedouble : fallback;
-        };
-        g_usage.session_pct   = f("session_pct",   -1);
-        g_usage.weekly_pct    = f("weekly_pct",    -1);
-        g_usage.opus_pct      = f("opus_pct",      -1);
-        g_usage.extra_balance = f("extra_balance", -1);
-        g_usage.reset_secs    = (int)f("tokens_reset_secs", -1);
+        g_usage.session_pct        = f("session_pct",      0);
+        g_usage.weekly_pct         = f("weekly_pct",       0);
+        g_usage.extra_balance      = f("extra_balance",   -1);
+        g_usage.session_reset_secs = (int)f("tokens_reset_secs", -1);
+        g_usage.weekly_reset_secs  = (int)f("weekly_reset_secs", -1);
+        cJSON *day_item = cJSON_GetObjectItemCaseSensitive(root, "weekly_reset_day");
+        if (day_item && cJSON_IsString(day_item) && day_item->valuestring) {
+            strncpy(g_usage.weekly_reset_day, day_item->valuestring, 3);
+            g_usage.weekly_reset_day[3] = '\0';
+        } else {
+            g_usage.weekly_reset_day[0] = '\0';
+        }
+        cJSON *time_item = cJSON_GetObjectItemCaseSensitive(root, "weekly_reset_time");
+        if (time_item && cJSON_IsString(time_item) && time_item->valuestring) {
+            strncpy(g_usage.weekly_reset_time, time_item->valuestring, 5);
+            g_usage.weekly_reset_time[5] = '\0';
+        } else {
+            g_usage.weekly_reset_time[0] = '\0';
+        }
         g_usage.valid = true;
         xSemaphoreGive(g_usage_lock);
     }
 
     cJSON_Delete(root);
-    ESP_LOGI(TAG, "Dados atualizados — session=%.1f%% weekly=%.1f%%",
-             g_usage.session_pct, g_usage.weekly_pct);
     return true;
 }
 
-// ════════════════════ LVGL UI ══════════════════════════════════════
+// ════════════════════ LVGL UI ═══════════════════════════════════════
 
-// Cor da barra conforme percentual
-static lv_color_t bar_color(float pct) {
-    if (pct < 0)    return lv_color_hex(0x4B5073);  // desconhecido
-    if (pct < 65.f) return lv_color_hex(0x26D24E);  // verde
-    if (pct < 85.f) return lv_color_hex(0xDCC800);  // amarelo
-    return lv_color_hex(0xD22626);                   // vermelho
-}
-
-// Cria um painel (container) de métrica com barra LVGL
-// Retorna: container obj; bar, lbl_pct, lbl_sub passados por ponteiro
-static lv_obj_t *create_metric_panel(lv_obj_t *parent,
-                                     int y, int h, lv_color_t bg,
-                                     const char *label, const char *tag,
-                                     lv_obj_t **out_bar,
-                                     lv_obj_t **out_lbl_pct,
-                                     lv_obj_t **out_lbl_sub) {
-    // Container
-    lv_obj_t *panel = lv_obj_create(parent);
-    lv_obj_set_pos(panel, 0, y);
-    lv_obj_set_size(panel, LCD_W, h);
-    lv_obj_set_style_bg_color(panel, bg, 0);
-    lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(panel, 0, 0);
-    lv_obj_set_style_pad_all(panel, 0, 0);
-    lv_obj_set_style_radius(panel, 0, 0);
-
-    // Rótulo principal (esquerda)
-    lv_obj_t *lbl = lv_label_create(panel);
-    lv_label_set_text(lbl, label);
-    lv_obj_set_style_text_color(lbl, lv_color_hex(0xDCE1FF), 0);
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_8, 0);
-    lv_obj_set_pos(lbl, 4, 2);
-
-    // Tag (direita, ex: "5h" / "7d")
-    if (tag && tag[0]) {
-        lv_obj_t *ltag = lv_label_create(panel);
-        lv_label_set_text(ltag, tag);
-        lv_obj_set_style_text_color(ltag, lv_color_hex(0x4B5073), 0);
-        lv_obj_set_style_text_font(ltag, &lv_font_montserrat_8, 0);
-        lv_obj_align(ltag, LV_ALIGN_TOP_RIGHT, -4, 2);
-    }
-
-    // Barra de progresso
-    lv_obj_t *bar = lv_bar_create(panel);
-    lv_obj_set_size(bar, LCD_W - 6, 9);
-    lv_obj_set_pos(bar, 3, 13);
-    lv_bar_set_range(bar, 0, 100);
-    lv_bar_set_value(bar, 0, LV_ANIM_OFF);
-
-    // Estilo do trilho (background)
-    static lv_style_t s_track;
-    lv_style_init(&s_track);
-    lv_style_set_bg_color(&s_track, lv_color_hex(0x14142A));
-    lv_style_set_radius(&s_track, 3);
-    lv_obj_add_style(bar, &s_track, LV_PART_MAIN);
-
-    // Estilo do indicador (fill) — cor atualizada via set_style_bg_color
-    static lv_style_t s_ind;
-    lv_style_init(&s_ind);
-    lv_style_set_bg_color(&s_ind, lv_color_hex(0x26D24E));
-    lv_style_set_radius(&s_ind, 3);
-    lv_obj_add_style(bar, &s_ind, LV_PART_INDICATOR);
-
-    // Percentagem (sobreposição direita, dentro da barra)
-    lv_obj_t *lpct = lv_label_create(panel);
-    lv_label_set_text(lpct, "--");
-    lv_obj_set_style_text_color(lpct, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(lpct, &lv_font_montserrat_8, 0);
-    lv_obj_set_pos(lpct, LCD_W - 28, 14);
-
-    // Sub-label (rodapé — reset time ou vazio)
-    lv_obj_t *lsub = lv_label_create(panel);
-    lv_label_set_text(lsub, "");
-    lv_obj_set_style_text_color(lsub, lv_color_hex(0x4B5073), 0);
-    lv_obj_set_style_text_font(lsub, &lv_font_montserrat_8, 0);
-    lv_obj_set_pos(lsub, 4, h - 11);
-
-    if (out_bar)     *out_bar     = bar;
-    if (out_lbl_pct) *out_lbl_pct = lpct;
-    if (out_lbl_sub) *out_lbl_sub = lsub;
-    return panel;
-}
 
 static void ui_create() {
-    // Fundo geral
     lv_obj_t *scr = lv_screen_active();
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x080A16), 0);
+    lv_obj_set_style_bg_color(scr, lv_color_hex(C_BG), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
-    // ── Top bar ─────────────────────────────────────────────────
+    // ── Top bar (18px) ───────────────────────────────────────────────
     lv_obj_t *topbar = lv_obj_create(scr);
     lv_obj_set_pos(topbar, 0, 0);
     lv_obj_set_size(topbar, LCD_W, 18);
-    lv_obj_set_style_bg_color(topbar, lv_color_hex(0x080A16), 0);
+    lv_obj_set_style_bg_color(topbar, lv_color_hex(C_TOPBAR), 0);
     lv_obj_set_style_bg_opa(topbar, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(topbar, 0, 0);
     lv_obj_set_style_pad_all(topbar, 0, 0);
     lv_obj_set_style_radius(topbar, 0, 0);
 
-    // Ícone WiFi (3 retângulos)
+    // Barras WiFi (3 retângulos, altura crescente)
     for (int i = 0; i < 3; i++) {
-        lv_obj_t *bar = lv_obj_create(topbar);
-        lv_obj_set_style_border_width(bar, 0, 0);
-        lv_obj_set_style_bg_color(bar, lv_color_hex(0x26D24E), 0);
-        lv_obj_set_style_radius(bar, 1, 0);
-        int bw = 2, bh = 4 + i * 3;
-        lv_obj_set_size(bar, bw, bh);
-        lv_obj_set_pos(bar, 2 + i * 4, 18 - 2 - bh);
+        g_wifi_bars[i] = lv_obj_create(topbar);
+        lv_obj_set_style_border_width(g_wifi_bars[i], 0, 0);
+        lv_obj_set_style_radius(g_wifi_bars[i], 1, 0);
+        lv_obj_set_style_bg_color(g_wifi_bars[i], lv_color_hex(C_DIV), 0);
+        int bh = 4 + i * 3;
+        lv_obj_set_size(g_wifi_bars[i], 2, bh);
+        lv_obj_set_pos(g_wifi_bars[i], 3 + i * 4, 18 - 2 - bh);
     }
-    // Salva referência ao primeiro retângulo para mudar cor depois
-    g_dot_wifi = lv_obj_get_child(topbar, 0);
 
-    // Título
-    lv_obj_t *title = lv_label_create(topbar);
-    lv_label_set_text(title, "CLAUDE METER");
-    lv_obj_set_style_text_color(title, lv_color_hex(0xDCE1FF), 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_8, 0);
-    lv_obj_align(title, LV_ALIGN_CENTER, 0, 0);
+    // "CLAUDE • WATCH" centralizado na topbar
+    lv_obj_t *lbl_l = lv_label_create(topbar);
+    lv_label_set_text(lbl_l, "CLAUDE");
+    lv_obj_set_style_text_color(lbl_l, lv_color_hex(C_WHITE), 0);
+    lv_obj_set_style_text_font(lbl_l, &lv_font_montserrat_8, 0);
+    lv_obj_set_pos(lbl_l, 43, 5);
 
-    // Ponto de status pulsante
-    g_lbl_status = lv_label_create(topbar);
-    lv_label_set_text(g_lbl_status, LV_SYMBOL_BULLET);
-    lv_obj_set_style_text_color(g_lbl_status, lv_color_hex(0x4B5073), 0);
-    lv_obj_set_style_text_font(g_lbl_status, &lv_font_montserrat_8, 0);
-    lv_obj_align(g_lbl_status, LV_ALIGN_TOP_RIGHT, -3, 4);
+    // Dot heartbeat (círculo verde, pisca)
+    g_dot_heartbeat = lv_obj_create(topbar);
+    lv_obj_set_size(g_dot_heartbeat, 5, 5);
+    lv_obj_set_style_radius(g_dot_heartbeat, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(g_dot_heartbeat, lv_color_hex(C_GREEN), 0);
+    lv_obj_set_style_bg_opa(g_dot_heartbeat, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(g_dot_heartbeat, 0, 0);
+    lv_obj_set_pos(g_dot_heartbeat, 80, 7);
 
-    // ── Painéis de métrica ────────────────────────────────────────
-    // session_pct = utilização da janela de 5 horas
-    create_metric_panel(scr, 20, 38, lv_color_hex(0x0C1C50),
-                        "SESSAO", "5h",
-                        &g_bar_s, &g_lbl_s_pct, &g_lbl_s_reset);
+    // "WATCH"
+    lv_obj_t *lbl_r = lv_label_create(topbar);
+    lv_label_set_text(lbl_r, "WATCH");
+    lv_obj_set_style_text_color(lbl_r, lv_color_hex(C_WHITE), 0);
+    lv_obj_set_style_text_font(lbl_r, &lv_font_montserrat_8, 0);
+    lv_obj_set_pos(lbl_r, 87, 5);
 
-    // weekly_pct = utilização semanal (todos os modelos)
-    create_metric_panel(scr, 60, 38, lv_color_hex(0x2D0C44),
-                        "SEMANAL", "7d",
-                        &g_bar_w, &g_lbl_w_pct, nullptr);
+    // Ícone bateria (placeholder — símbolo LVGL)
+    lv_obj_t *lbl_bat = lv_label_create(topbar);
+    lv_label_set_text(lbl_bat, LV_SYMBOL_BATTERY_FULL);
+    lv_obj_set_style_text_color(lbl_bat, lv_color_hex(C_TEXT), 0);
+    lv_obj_set_style_text_font(lbl_bat, &lv_font_montserrat_8, 0);
+    lv_obj_align(lbl_bat, LV_ALIGN_TOP_RIGHT, -3, 5);
 
-    // opus_pct = utilização semanal do Opus/Design
-    create_metric_panel(scr, 100, 30, lv_color_hex(0x08373E),
-                        "OPUS", "7d",
-                        &g_bar_o, &g_lbl_o_pct, nullptr);
+    // ── Arc sessão (esquerda) — círculo completo, laranja ────────────
+    // Centro: x=48, y=67; raio=36
+    const int ARC_S_X = 48, ARC_S_Y = 67, ARC_S_R = 36;
 
-    // ── Painel saldo ─────────────────────────────────────────────
-    lv_obj_t *bal_panel = lv_obj_create(scr);
-    lv_obj_set_pos(bal_panel, 0, 132);
-    lv_obj_set_size(bal_panel, LCD_W, 26);
-    lv_obj_set_style_bg_color(bal_panel, lv_color_hex(0x082C12), 0);
-    lv_obj_set_style_bg_opa(bal_panel, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(bal_panel, 0, 0);
-    lv_obj_set_style_pad_all(bal_panel, 0, 0);
-    lv_obj_set_style_radius(bal_panel, 0, 0);
+    g_arc_session = lv_arc_create(scr);
+    lv_obj_remove_style_all(g_arc_session);  // remove tema padrão (azul)
+    lv_obj_set_size(g_arc_session, ARC_S_R * 2, ARC_S_R * 2);
+    lv_obj_set_pos(g_arc_session, ARC_S_X - ARC_S_R, ARC_S_Y - ARC_S_R);
+    lv_arc_set_rotation(g_arc_session, 270);
+    lv_arc_set_bg_angles(g_arc_session, 0, 360);
+    lv_arc_set_range(g_arc_session, 0, 100);
+    lv_arc_set_value(g_arc_session, 0);
+    lv_arc_set_mode(g_arc_session, LV_ARC_MODE_NORMAL);
 
-    lv_obj_t *lbal_title = lv_label_create(bal_panel);
-    lv_label_set_text(lbal_title, "CREDITO EXTRA");
-    lv_obj_set_style_text_color(lbal_title, lv_color_hex(0x4B5073), 0);
-    lv_obj_set_style_text_font(lbal_title, &lv_font_montserrat_8, 0);
-    lv_obj_set_pos(lbal_title, 4, 2);
+    lv_obj_set_style_arc_color(g_arc_session, lv_color_hex(C_ARC_BG), LV_PART_MAIN);
+    lv_obj_set_style_arc_width(g_arc_session, 8, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(g_arc_session, lv_color_hex(C_SESSION), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_width(g_arc_session, 8, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(g_arc_session, LV_OPA_TRANSP, LV_PART_KNOB);
 
-    g_lbl_balance = lv_label_create(bal_panel);
-    lv_label_set_text(g_lbl_balance, "N/D");
-    lv_obj_set_style_text_color(g_lbl_balance, lv_color_hex(0x26D24E), 0);
-    lv_obj_set_style_text_font(g_lbl_balance, &lv_font_montserrat_12, 0);
-    lv_obj_align(g_lbl_balance, LV_ALIGN_BOTTOM_MID, 0, -2);
+    // Percentagem centralizada no arco — branco, montserrat_20
+    g_lbl_session_pct = lv_label_create(scr);
+    lv_label_set_text(g_lbl_session_pct, "--");
+    lv_obj_set_size(g_lbl_session_pct, 60, 24);
+    lv_obj_set_pos(g_lbl_session_pct, ARC_S_X - 30, ARC_S_Y - 12);
+    lv_obj_set_style_text_align(g_lbl_session_pct, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(g_lbl_session_pct, lv_color_hex(C_WHITE), 0);
+    lv_obj_set_style_text_font(g_lbl_session_pct, &lv_font_montserrat_20, 0);
+
+    // "SESSION" label — centralizado abaixo do arco
+    g_lbl_session_label = lv_label_create(scr);
+    lv_label_set_text(g_lbl_session_label, "SESSION");
+    lv_obj_set_size(g_lbl_session_label, 72, 10);
+    lv_obj_set_style_text_align(g_lbl_session_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(g_lbl_session_label, lv_color_hex(C_LABEL), 0);
+    lv_obj_set_style_text_font(g_lbl_session_label, &lv_font_montserrat_8, 0);
+    lv_obj_align_to(g_lbl_session_label, g_arc_session, LV_ALIGN_OUT_BOTTOM_MID, 0, 3);
+
+    // Tempo de reset da sessão — centralizado abaixo do label
+    g_lbl_session_reset = lv_label_create(scr);
+    lv_label_set_text(g_lbl_session_reset, "--");
+    lv_obj_set_size(g_lbl_session_reset, 72, 10);
+    lv_obj_set_style_text_align(g_lbl_session_reset, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(g_lbl_session_reset, lv_color_hex(C_SESSION), 0);
+    lv_obj_set_style_text_font(g_lbl_session_reset, &lv_font_montserrat_8, 0);
+    lv_obj_align_to(g_lbl_session_reset, g_lbl_session_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 0);
+
+    // ── Arc semanal — círculo completo, branco ───────────────────────
+    // Centro: x=110, y=50; raio=14
+    const int ARC_W_X = 110, ARC_W_Y = 50, ARC_W_R = 14;
+
+    g_arc_weekly = lv_arc_create(scr);
+    lv_obj_remove_style_all(g_arc_weekly);  // remove tema padrão
+    lv_obj_set_size(g_arc_weekly, ARC_W_R * 2, ARC_W_R * 2);
+    lv_obj_set_pos(g_arc_weekly, ARC_W_X - ARC_W_R, ARC_W_Y - ARC_W_R);
+    lv_arc_set_rotation(g_arc_weekly, 270);
+    lv_arc_set_bg_angles(g_arc_weekly, 0, 360);
+    lv_arc_set_range(g_arc_weekly, 0, 100);
+    lv_arc_set_value(g_arc_weekly, 0);
+    lv_arc_set_mode(g_arc_weekly, LV_ARC_MODE_NORMAL);
+
+    lv_obj_set_style_arc_color(g_arc_weekly, lv_color_hex(C_ARC_BG), LV_PART_MAIN);
+    lv_obj_set_style_arc_width(g_arc_weekly, 4, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(g_arc_weekly, lv_color_hex(C_WHITE), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_width(g_arc_weekly, 4, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(g_arc_weekly, LV_OPA_TRANSP, LV_PART_KNOB);
+
+    // "WEEKLY" — alinhado à direita
+    lv_obj_t *lbl_semanal = lv_label_create(scr);
+    lv_label_set_text(lbl_semanal, "WEEKLY");
+    lv_obj_set_size(lbl_semanal, 60, 10);
+    lv_obj_set_pos(lbl_semanal, 97, 31);
+    lv_obj_set_style_text_align(lbl_semanal, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_style_text_color(lbl_semanal, lv_color_hex(C_LABEL), 0);
+    lv_obj_set_style_text_font(lbl_semanal, &lv_font_montserrat_8, 0);
+
+    // % semanal — fora do arco, entre "WEEKLY" e o horário, alinhado à direita
+    g_lbl_weekly_pct = lv_label_create(scr);
+    lv_label_set_text(g_lbl_weekly_pct, "--");
+    lv_obj_set_size(g_lbl_weekly_pct, 60, 14);
+    lv_obj_set_pos(g_lbl_weekly_pct, 97, 43);
+    lv_obj_set_style_text_align(g_lbl_weekly_pct, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_style_text_color(g_lbl_weekly_pct, lv_color_hex(C_WHITE), 0);
+    lv_obj_set_style_text_font(g_lbl_weekly_pct, &lv_font_montserrat_12, 0);
+
+    // Horário do reset semanal — alinhado à direita, formato HH:MM
+    g_lbl_weekly_reset = lv_label_create(scr);
+    lv_label_set_text(g_lbl_weekly_reset, "--:--");
+    lv_obj_set_size(g_lbl_weekly_reset, 60, 10);
+    lv_obj_set_pos(g_lbl_weekly_reset, 97, 60);
+    lv_obj_set_style_text_align(g_lbl_weekly_reset, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_style_text_color(g_lbl_weekly_reset, lv_color_hex(C_TEXT), 0);
+    lv_obj_set_style_text_font(g_lbl_weekly_reset, &lv_font_montserrat_8, 0);
+
+    // ── Linha divisória entre WEEKLY e EXTRA ─────────────────────────
+    lv_obj_t *hdiv = lv_obj_create(scr);
+    lv_obj_set_pos(hdiv, 97, 73);
+    lv_obj_set_size(hdiv, 60, 1);
+    lv_obj_set_style_bg_color(hdiv, lv_color_hex(C_DIV), 0);
+    lv_obj_set_style_bg_opa(hdiv, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(hdiv, 0, 0);
+    lv_obj_set_style_radius(hdiv, 0, 0);
+
+    // ── EXTRA — mesmo padrão que WEEKLY ─────────────────────────────
+    lv_obj_t *lbl_extra = lv_label_create(scr);
+    lv_label_set_text(lbl_extra, "EXTRA");
+    lv_obj_set_size(lbl_extra, 60, 10);
+    lv_obj_set_pos(lbl_extra, 97, 76);
+    lv_obj_set_style_text_align(lbl_extra, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_style_text_color(lbl_extra, lv_color_hex(C_LABEL), 0);
+    lv_obj_set_style_text_font(lbl_extra, &lv_font_montserrat_8, 0);
+
+    // Saldo extra — alinhado à direita, fonte menor
+    g_lbl_balance = lv_label_create(scr);
+    lv_label_set_text(g_lbl_balance, "--");
+    lv_obj_set_size(g_lbl_balance, 60, 16);
+    lv_obj_set_pos(g_lbl_balance, 97, 89);
+    lv_obj_set_style_text_align(g_lbl_balance, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_style_text_color(g_lbl_balance, lv_color_hex(C_GREEN), 0);
+    lv_obj_set_style_text_font(g_lbl_balance, &lv_font_montserrat_14, 0);
 }
 
-// Atualiza widgets com dados mais recentes
 static void ui_update() {
     claude_usage_t u;
     if (xSemaphoreTake(g_usage_lock, pdMS_TO_TICKS(100)) != pdTRUE) return;
     u = g_usage;
     xSemaphoreGive(g_usage_lock);
 
-    // Helper: atualiza barra + label %
-    auto update_bar = [](lv_obj_t *bar, lv_obj_t *lbl, float pct) {
-        char buf[8];
-        if (pct < 0) {
-            lv_bar_set_value(bar, 0, LV_ANIM_ON);
-            lv_label_set_text(lbl, "--");
-            lv_obj_set_style_bg_color(bar, lv_color_hex(0x4B5073), LV_PART_INDICATOR);
-        } else {
-            int v = (int)(pct + .5f);
-            lv_bar_set_value(bar, v, LV_ANIM_ON);
-            snprintf(buf, sizeof(buf), "%d%%", v);
-            lv_label_set_text(lbl, buf);
-            lv_obj_set_style_bg_color(bar, bar_color(pct), LV_PART_INDICATOR);
-            lv_obj_set_style_text_color(lbl, bar_color(pct), 0);
-        }
-    };
+    // Arc sessão — cor sempre laranja (C_SESSION)
+    int sv = (u.session_pct > 0) ? (int)(u.session_pct + .5f) : 0;
+    lv_arc_set_value(g_arc_session, sv);
 
-    update_bar(g_bar_s, g_lbl_s_pct, u.session_pct);
-    update_bar(g_bar_w, g_lbl_w_pct, u.weekly_pct);
-    update_bar(g_bar_o, g_lbl_o_pct, u.opus_pct);
-
-    // Reset time
-    if (g_lbl_s_reset) {
-        if (u.reset_secs > 0) {
-            int h = u.reset_secs / 3600, m = (u.reset_secs % 3600) / 60;
-            char rb[20];
-            if (h > 0) snprintf(rb, sizeof(rb), "reset: %dh%02dm", h, m);
-            else        snprintf(rb, sizeof(rb), "reset: %dm", m);
-            lv_label_set_text(g_lbl_s_reset, rb);
-        } else {
-            lv_label_set_text(g_lbl_s_reset, "");
-        }
-    }
-
-    // Saldo extra
-    char bbuf[16];
-    if (u.extra_balance < 0) {
-        lv_label_set_text(g_lbl_balance, "N/D");
-        lv_obj_set_style_text_color(g_lbl_balance, lv_color_hex(0x4B5073), 0);
+    char buf[24];
+    if (u.valid && u.session_pct >= 0) {
+        snprintf(buf, sizeof(buf), "%d%%", sv);
+        lv_label_set_text(g_lbl_session_pct, buf);
+        lv_obj_set_style_text_color(g_lbl_session_pct, lv_color_hex(C_WHITE), 0);
     } else {
-        snprintf(bbuf, sizeof(bbuf), "R$%.2f", u.extra_balance);
-        lv_label_set_text(g_lbl_balance, bbuf);
-        lv_color_t bc = (u.extra_balance < 5.f) ? lv_color_hex(0xDCC800) : lv_color_hex(0x26D24E);
-        lv_obj_set_style_text_color(g_lbl_balance, bc, 0);
+        lv_label_set_text(g_lbl_session_pct, "--");
+        lv_obj_set_style_text_color(g_lbl_session_pct, lv_color_hex(C_LABEL), 0);
     }
 
-    // Status WiFi (ícone)
-    lv_color_t wc = g_wifi_ok ? lv_color_hex(0x26D24E) : lv_color_hex(0xD22626);
-    for (int i = 0; i < 3; i++) {
-        lv_obj_t *bar_w = lv_obj_get_parent(g_dot_wifi);
-        lv_obj_t *child = lv_obj_get_child(bar_w, i);
-        if (child) lv_obj_set_style_bg_color(child, wc, 0);
+    // Reset sessão — cor laranja igual ao arco
+    fmt_reset(buf, sizeof(buf), u.session_reset_secs);
+    lv_label_set_text(g_lbl_session_reset, buf);
+    lv_obj_set_style_text_color(g_lbl_session_reset, lv_color_hex(C_SESSION), 0);
+
+    // Arc semanal
+    int wv = (u.weekly_pct > 0) ? (int)(u.weekly_pct + .5f) : 0;
+    lv_arc_set_value(g_arc_weekly, wv);
+
+    if (u.valid && u.weekly_pct >= 0) {
+        snprintf(buf, sizeof(buf), "%d%%", wv);
+        lv_label_set_text(g_lbl_weekly_pct, buf);
+    } else {
+        lv_label_set_text(g_lbl_weekly_pct, "--");
     }
+
+    // Reset semanal — horário local Brasília vindo direto do proxy
+    if (u.weekly_reset_day[0] != '\0') {
+        const char *t = u.weekly_reset_time[0] ? u.weekly_reset_time : "--:--";
+        snprintf(buf, sizeof(buf), "%s %s", u.weekly_reset_day, t);
+    } else {
+        snprintf(buf, sizeof(buf), "--:--");
+    }
+    lv_label_set_text(g_lbl_weekly_reset, buf);
+
+    // Saldo
+    if (u.extra_balance >= 0) {
+        snprintf(buf, sizeof(buf), "R$%.2f", u.extra_balance);
+        lv_label_set_text(g_lbl_balance, buf);
+    } else {
+        lv_label_set_text(g_lbl_balance, "--");
+    }
+
+    // WiFi bars
+    lv_color_t wc = g_wifi_ok ? lv_color_hex(C_GREEN) : lv_color_hex(0x4A1A1A);
+    for (int i = 0; i < 3; i++)
+        lv_obj_set_style_bg_color(g_wifi_bars[i], wc, 0);
 }
 
 // ════════════════════ TASKS ════════════════════════════════════════
 
-// Task de fetch HTTP — roda a cada REFRESH_SEC
 static void fetch_task(void *) {
-    // Aguarda WiFi
     xEventGroupWaitBits(g_wifi_events, WIFI_CONNECTED_BIT,
                         pdFALSE, pdFALSE, portMAX_DELAY);
-    vTaskDelay(pdMS_TO_TICKS(1000));  // dá tempo ao TCP stack
+    vTaskDelay(pdMS_TO_TICKS(1000));
 
     while (true) {
-        // Pisca status verde durante fetch
-        if (lvgl_port_lock(100)) {
-            lv_obj_set_style_text_color(g_lbl_status, lv_color_hex(0x26D24E), 0);
-            lvgl_port_unlock();
-        }
-
         fetch_usage();
 
         if (lvgl_port_lock(100)) {
             ui_update();
-            lv_obj_set_style_text_color(g_lbl_status,
-                g_wifi_ok ? lv_color_hex(0x1A4A28) : lv_color_hex(0x4A1A1A), 0);
             lvgl_port_unlock();
         }
 
@@ -571,26 +591,22 @@ static void fetch_task(void *) {
     }
 }
 
-// Pulsa o ponto de status (blink) — leve task auxiliar
-static void blink_task(void *) {
-    uint8_t tick = 0;
+static void heartbeat_task(void *) {
+    bool on = true;
     while (true) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        tick ^= 1;
-        lv_color_t c = tick
-            ? (g_wifi_ok ? lv_color_hex(0x1A6A38) : lv_color_hex(0x6A1A1A))
-            : lv_color_hex(0x0D0D20);
+        vTaskDelay(pdMS_TO_TICKS(800));
+        on = !on;
         if (lvgl_port_lock(50)) {
-            lv_obj_set_style_text_color(g_lbl_status, c, 0);
+            lv_obj_set_style_bg_color(g_dot_heartbeat,
+                on ? lv_color_hex(C_GREEN) : lv_color_hex(C_BG), 0);
             lvgl_port_unlock();
         }
     }
 }
 
-// ════════════════════ APP MAIN ═════════════════════════════════════
+// ════════════════════ APP MAIN ════════════════════════════════════
 
 extern "C" void app_main() {
-    // NVS (necessário para WiFi)
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase();
@@ -617,24 +633,21 @@ extern "C" void app_main() {
     dev.pre_cb         = spi_pre_transfer;
     ESP_ERROR_CHECK(spi_bus_add_device(LCD_HOST, &dev, &g_spi));
 
-    // ── GPIO RST e DC ─────────────────────────────────────────────
+    // ── GPIO RST / DC ──────────────────────────────────────────────
     gpio_config_t io = {};
-    io.pin_bit_mask  = (1ULL << GPIO_DC) | (1ULL << GPIO_RST);
-    io.mode          = GPIO_MODE_OUTPUT;
+    io.pin_bit_mask = (1ULL << GPIO_DC) | (1ULL << GPIO_RST);
+    io.mode         = GPIO_MODE_OUTPUT;
     gpio_config(&io);
     gpio_set_level((gpio_num_t)GPIO_DC,  1);
     gpio_set_level((gpio_num_t)GPIO_RST, 1);
 
-    // ── ST7735 init ────────────────────────────────────────────────
     st7735_init();
-    ESP_LOGI(TAG, "ST7735 inicializado");
+    ESP_LOGI(TAG, "ST7735 OK (landscape 160x128)");
 
-    // ── LVGL init — lvgl_port gerencia tick e mutex ────────────────
+    // ── LVGL ───────────────────────────────────────────────────────
     const lvgl_port_cfg_t lvgl_cfg = ESP_LVGL_PORT_INIT_CONFIG();
     lvgl_port_init(&lvgl_cfg);
 
-    // Cria display com driver SPI próprio — sem esp_lcd panel.
-    // LVGL v9: byte swap via LV_COLOR_FORMAT_RGB565_SWAPPED (LV_COLOR_16_SWAP foi removido)
     static lv_color_t disp_buf1[LCD_W * 20];
     static lv_color_t disp_buf2[LCD_W * 20];
     g_disp = lv_display_create(LCD_W, LCD_H);
@@ -643,30 +656,34 @@ extern "C" void app_main() {
                            sizeof(disp_buf1), LV_DISPLAY_RENDER_MODE_PARTIAL);
     lv_display_set_flush_cb(g_disp, lvgl_flush_cb);
 
-    // ── Cria UI ────────────────────────────────────────────────────
+    // Tick LVGL
+    {
+        const esp_timer_create_args_t ta = {
+            .callback = [](void*){ lv_tick_inc(5); },
+            .name     = "lvgl_tick",
+        };
+        esp_timer_handle_t th;
+        esp_timer_create(&ta, &th);
+        esp_timer_start_periodic(th, 5000);
+    }
+
     if (lvgl_port_lock(0)) {
         ui_create();
         lvgl_port_unlock();
     }
 
-    // ── WiFi ───────────────────────────────────────────────────────
     wifi_init();
-    ESP_LOGI(TAG, "WiFi iniciando...");
 
-    // ── Tasks ──────────────────────────────────────────────────────
-    // lvgl_port_add_disp não foi chamado → não há task interna de LVGL;
-    // criamos a nossa que chama lv_timer_handler().
-    xTaskCreate(fetch_task,  "fetch",  8192, nullptr, 5, nullptr);
-    xTaskCreate(blink_task,  "blink",  2048, nullptr, 3, nullptr);
+    // LVGL handler task
     xTaskCreate([](void*) {
         while (true) {
-            if (lvgl_port_lock(10)) {
-                lv_timer_handler();
-                lvgl_port_unlock();
-            }
+            if (lvgl_port_lock(10)) { lv_timer_handler(); lvgl_port_unlock(); }
             vTaskDelay(pdMS_TO_TICKS(10));
         }
     }, "lvgl", 8192, nullptr, 4, nullptr);
+
+    xTaskCreate(fetch_task,     "fetch",  8192, nullptr, 5, nullptr);
+    xTaskCreate(heartbeat_task, "hbeat",  2048, nullptr, 3, nullptr);
 
     ESP_LOGI(TAG, "ClaudeMeter iniciado");
 }

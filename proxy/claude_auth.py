@@ -110,6 +110,18 @@ def _parse_usage_response(data: dict) -> dict | None:
     seven_day = data.get("seven_day")
     if isinstance(seven_day, dict) and "utilization" in seven_day:
         result["weekly_pct"] = float(seven_day["utilization"])
+        resets_at = seven_day.get("resets_at")
+        if resets_at:
+            try:
+                dt = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
+                secs = max(0, int((dt - datetime.now(timezone.utc)).total_seconds()))
+                result["weekly_reset_secs"] = secs
+                days = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+                dt_local = dt.astimezone()  # use Pi's system timezone
+                result["weekly_reset_day"] = days[dt_local.weekday()]
+                result["weekly_reset_time"] = dt_local.strftime("%H:%M")
+            except Exception:
+                pass
 
     seven_day_omelette = data.get("seven_day_omelette")
     if isinstance(seven_day_omelette, dict) and "utilization" in seven_day_omelette:
@@ -171,6 +183,9 @@ async def fetch_claude_usage() -> dict:
         "opus_pct": -1.0,
         "extra_balance": -1.0,
         "reset_secs": -1,
+        "weekly_reset_secs": -1,
+        "weekly_reset_day": "",
+        "weekly_reset_time": "",
     }
 
     cookies_list = _load_cookies()
