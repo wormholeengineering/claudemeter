@@ -24,6 +24,9 @@
 #include "esp_timer.h"
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
 #include "cJSON.h"
 
 #include "lvgl.h"
@@ -36,11 +39,12 @@
 #define REFRESH_SEC    60
 
 // ─── PINOS ─────────────────────────────────────────────────────────
-#define GPIO_MOSI  6
-#define GPIO_SCLK  4
-#define GPIO_CS   21
-#define GPIO_DC    1
-#define GPIO_RST   3
+#define GPIO_MOSI     1
+#define GPIO_SCLK    21
+#define GPIO_CS       4
+#define GPIO_DC       3
+#define GPIO_RST      2
+#define GPIO_BAT_ADC  0
 
 // ─── DISPLAY (landscape) ────────────────────────────────────────────
 #define LCD_HOST        SPI2_HOST
@@ -62,6 +66,14 @@
 #define C_LABEL     0x606060   // labels "SESSAO", "SEMANAL", "EXTRA"
 #define C_TEXT      0xC8C8C8   // texto secundário (tempo reset)
 #define C_WHITE     0xE8E8E8   // texto principal
+
+// ─── BATERIA ────────────────────────────────────────────────────────
+#define BAT_ADC_CHAN      ADC_CHANNEL_0
+#define BAT_V_FULL_MV     4200
+#define BAT_V_EMPTY_MV    3000
+#define BAT_DIV_MULT     3251   // R1+R2 = 102.6k+222.5k (×10 para precisão inteira)
+#define BAT_DIV_DIV      2225   // R2 = 222.5k (×10)
+#define BAT_CHG_THR_MV    80
 
 static const char *TAG = "claudemeter";
 
@@ -104,6 +116,13 @@ static lv_obj_t *g_lbl_balance;
 
 static lv_obj_t *g_dot_heartbeat;
 static lv_obj_t *g_wifi_bars[3];
+static lv_obj_t *g_lbl_bat;
+
+// ─── ADC bateria ─────────────────────────────────────────────────────
+static adc_oneshot_unit_handle_t g_adc_handle;
+static adc_cali_handle_t         g_adc_cali;
+static struct { int mv; int pct; bool charging; } g_bat = {3700, 50, false};
+static SemaphoreHandle_t g_bat_lock;
 
 // ════════════════════ ST7735 DRIVER ════════════════════════════════
 
@@ -384,12 +403,12 @@ static void ui_create() {
     lv_obj_set_style_text_font(lbl_r, &lv_font_montserrat_8, 0);
     lv_obj_set_pos(lbl_r, 87, 5);
 
-    // Ícone bateria (placeholder — símbolo LVGL)
-    lv_obj_t *lbl_bat = lv_label_create(topbar);
-    lv_label_set_text(lbl_bat, LV_SYMBOL_BATTERY_FULL);
-    lv_obj_set_style_text_color(lbl_bat, lv_color_hex(C_TEXT), 0);
-    lv_obj_set_style_text_font(lbl_bat, &lv_font_montserrat_8, 0);
-    lv_obj_align(lbl_bat, LV_ALIGN_TOP_RIGHT, -3, 5);
+    // Ícone bateria
+    g_lbl_bat = lv_label_create(topbar);
+    lv_label_set_text(g_lbl_bat, LV_SYMBOL_BATTERY_FULL);
+    lv_obj_set_style_text_color(g_lbl_bat, lv_color_hex(C_TEXT), 0);
+    lv_obj_set_style_text_font(g_lbl_bat, &lv_font_montserrat_12, 0);
+    lv_obj_align(g_lbl_bat, LV_ALIGN_TOP_RIGHT, -3, 3);
 
     // ── Arc sessão (esquerda) — círculo completo, laranja ────────────
     // Centro: x=48, y=67; raio=36
@@ -604,6 +623,79 @@ static void heartbeat_task(void *) {
     }
 }
 
+// ════════════════════ BATERIA ══════════════════════════════════════
+
+static void battery_init() {
+    adc_oneshot_unit_init_cfg_t unit_cfg = { .unit_id = ADC_UNIT_1 };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &g_adc_handle));
+
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .atten    = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(g_adc_handle, BAT_ADC_CHAN, &chan_cfg));
+
+    adc_cali_curve_fitting_config_t cali_cfg = {
+        .unit_id  = ADC_UNIT_1,
+        .chan     = BAT_ADC_CHAN,
+        .atten    = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    adc_cali_create_scheme_curve_fitting(&cali_cfg, &g_adc_cali);
+}
+
+static int battery_read_mv() {
+    int sum = 0;
+    for (int i = 0; i < 8; i++) {
+        int raw = 0;
+        adc_oneshot_read(g_adc_handle, BAT_ADC_CHAN, &raw);
+        sum += raw;
+    }
+    int mv_adc = 0;
+    adc_cali_raw_to_voltage(g_adc_cali, sum / 8, &mv_adc);
+    return mv_adc * BAT_DIV_MULT / BAT_DIV_DIV;
+}
+
+static void battery_task(void *) {
+    int  prev_mv  = 0;
+    bool charging = false;
+
+    while (true) {
+        int mv  = battery_read_mv();
+        int pct = (mv - BAT_V_EMPTY_MV) * 100 / (BAT_V_FULL_MV - BAT_V_EMPTY_MV);
+        pct = pct < 0 ? 0 : pct > 100 ? 100 : pct;
+
+        if (prev_mv > 0) {
+            int delta = mv - prev_mv;
+            if (delta >  BAT_CHG_THR_MV) charging = true;
+            else if (delta < -50)         charging = false;
+        }
+        prev_mv = mv;
+
+        if (xSemaphoreTake(g_bat_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+            g_bat.mv = mv; g_bat.pct = pct; g_bat.charging = charging;
+            xSemaphoreGive(g_bat_lock);
+        }
+
+        if (lvgl_port_lock(100)) {
+            const char *sym = charging  ? LV_SYMBOL_CHARGE        :
+                              pct >= 75 ? LV_SYMBOL_BATTERY_FULL  :
+                              pct >= 50 ? LV_SYMBOL_BATTERY_3     :
+                              pct >= 25 ? LV_SYMBOL_BATTERY_2     :
+                              pct >= 10 ? LV_SYMBOL_BATTERY_1     :
+                                          LV_SYMBOL_BATTERY_EMPTY;
+            lv_label_set_text(g_lbl_bat, sym);
+            lv_color_t c = charging ? lv_color_hex(C_GREEN)  :
+                           pct < 20 ? lv_color_hex(0xFF4040) :
+                                      lv_color_hex(C_TEXT);
+            lv_obj_set_style_text_color(g_lbl_bat, c, 0);
+            lvgl_port_unlock();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10000));
+    }
+}
+
 // ════════════════════ APP MAIN ════════════════════════════════════
 
 extern "C" void app_main() {
@@ -614,6 +706,8 @@ extern "C" void app_main() {
     }
 
     g_usage_lock = xSemaphoreCreateMutex();
+    g_bat_lock   = xSemaphoreCreateMutex();
+    battery_init();
 
     // ── SPI bus ────────────────────────────────────────────────────
     spi_bus_config_t bus = {};
@@ -684,6 +778,7 @@ extern "C" void app_main() {
 
     xTaskCreate(fetch_task,     "fetch",  8192, nullptr, 5, nullptr);
     xTaskCreate(heartbeat_task, "hbeat",  2048, nullptr, 3, nullptr);
+    xTaskCreate(battery_task,   "bat",    3072, nullptr, 3, nullptr);
 
     ESP_LOGI(TAG, "ClaudeMeter iniciado");
 }
