@@ -1,8 +1,8 @@
 /*
  * ClaudeMeter — ESP-IDF 5.x + LVGL v9
- * ESP32-C3 Super Mini + ST7735 1.8" SPI (160×128 landscape)
+ * ESP32-C3 Super Mini + ST7735 1.8" SPI (128×160 portrait)
  *
- * Layout: arc gauge sessão (esq), arc gauge semanal + saldo extra (dir)
+ * Layout: topbar | arc sessão grande | seção semanal+extra
  * Dados via proxy HTTP local (ver /proxy/server.py).
  */
 
@@ -46,14 +46,14 @@
 #define GPIO_RST      2
 #define GPIO_BAT_ADC  0
 
-// ─── DISPLAY (landscape) ────────────────────────────────────────────
+// ─── DISPLAY (portrait) ─────────────────────────────────────────────
 #define LCD_HOST        SPI2_HOST
 #define LCD_FREQ_HZ     (26 * 1000 * 1000)
-#define LCD_W           160
-#define LCD_H           128
-// Offsets GREENTAB em landscape
-#define ST7735_X_OFFSET  1
-#define ST7735_Y_OFFSET  2
+#define LCD_W           128
+#define LCD_H           160
+// Offsets GREENTAB em portrait
+#define ST7735_X_OFFSET  2
+#define ST7735_Y_OFFSET  1
 
 // ─── CORES ──────────────────────────────────────────────────────────
 #define C_BG        0x141414   // fundo
@@ -187,8 +187,8 @@ static void st7735_init() {
 
     st7735_cmd(0x20);  // INVOFF
 
-    // Landscape: MX+MV=landscape, BGR=0 (0x68 tinha BGR=1 que invertia R↔B)
-    st7735_cmd(0x36); st7735_data1(0x60);
+    // Portrait: sem mirror/swap, BGR=0
+    st7735_cmd(0x36); st7735_data1(0x00);
     st7735_cmd(0x3A); st7735_data1(0x05);  // COLMOD 16-bit
 
     // Área GREENTAB em landscape (x offset=1, y offset=2)
@@ -369,7 +369,7 @@ static void ui_create() {
     lv_obj_set_style_pad_all(topbar, 0, 0);
     lv_obj_set_style_radius(topbar, 0, 0);
 
-    // Barras WiFi (3 retângulos, altura crescente)
+    // Barras WiFi
     for (int i = 0; i < 3; i++) {
         g_wifi_bars[i] = lv_obj_create(topbar);
         lv_obj_set_style_border_width(g_wifi_bars[i], 0, 0);
@@ -380,42 +380,39 @@ static void ui_create() {
         lv_obj_set_pos(g_wifi_bars[i], 3 + i * 4, 18 - 2 - bh);
     }
 
-    // "CLAUDE • WATCH" centralizado na topbar
+    // "CLAUDE • WATCH" centralizado — portrait: LCD_W=128, centro x=64
     lv_obj_t *lbl_l = lv_label_create(topbar);
     lv_label_set_text(lbl_l, "CLAUDE");
     lv_obj_set_style_text_color(lbl_l, lv_color_hex(C_WHITE), 0);
     lv_obj_set_style_text_font(lbl_l, &lv_font_montserrat_8, 0);
-    lv_obj_set_pos(lbl_l, 43, 5);
+    lv_obj_set_pos(lbl_l, 23, 5);
 
-    // Dot heartbeat (círculo verde, pisca)
     g_dot_heartbeat = lv_obj_create(topbar);
     lv_obj_set_size(g_dot_heartbeat, 5, 5);
     lv_obj_set_style_radius(g_dot_heartbeat, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(g_dot_heartbeat, lv_color_hex(C_GREEN), 0);
     lv_obj_set_style_bg_opa(g_dot_heartbeat, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(g_dot_heartbeat, 0, 0);
-    lv_obj_set_pos(g_dot_heartbeat, 80, 7);
+    lv_obj_set_pos(g_dot_heartbeat, 62, 7);
 
-    // "WATCH"
     lv_obj_t *lbl_r = lv_label_create(topbar);
     lv_label_set_text(lbl_r, "WATCH");
     lv_obj_set_style_text_color(lbl_r, lv_color_hex(C_WHITE), 0);
     lv_obj_set_style_text_font(lbl_r, &lv_font_montserrat_8, 0);
-    lv_obj_set_pos(lbl_r, 87, 5);
+    lv_obj_set_pos(lbl_r, 70, 5);
 
-    // Ícone bateria
     g_lbl_bat = lv_label_create(topbar);
     lv_label_set_text(g_lbl_bat, LV_SYMBOL_BATTERY_FULL);
     lv_obj_set_style_text_color(g_lbl_bat, lv_color_hex(C_TEXT), 0);
     lv_obj_set_style_text_font(g_lbl_bat, &lv_font_montserrat_12, 0);
     lv_obj_align(g_lbl_bat, LV_ALIGN_TOP_RIGHT, -3, 3);
 
-    // ── Arc sessão (esquerda) — círculo completo, laranja ────────────
-    // Centro: x=48, y=67; raio=36
-    const int ARC_S_X = 48, ARC_S_Y = 67, ARC_S_R = 36;
+    // ── Arc sessão — grande, centrado (portrait) ─────────────────────
+    // Centro: x=64, y=61; raio=41  → arco y=20..102
+    const int ARC_S_X = 64, ARC_S_Y = 61, ARC_S_R = 41;
 
     g_arc_session = lv_arc_create(scr);
-    lv_obj_remove_style_all(g_arc_session);  // remove tema padrão (azul)
+    lv_obj_remove_style_all(g_arc_session);
     lv_obj_set_size(g_arc_session, ARC_S_R * 2, ARC_S_R * 2);
     lv_obj_set_pos(g_arc_session, ARC_S_X - ARC_S_R, ARC_S_Y - ARC_S_R);
     lv_arc_set_rotation(g_arc_session, 270);
@@ -425,44 +422,63 @@ static void ui_create() {
     lv_arc_set_mode(g_arc_session, LV_ARC_MODE_NORMAL);
 
     lv_obj_set_style_arc_color(g_arc_session, lv_color_hex(C_ARC_BG), LV_PART_MAIN);
-    lv_obj_set_style_arc_width(g_arc_session, 8, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(g_arc_session, 10, LV_PART_MAIN);
     lv_obj_set_style_arc_color(g_arc_session, lv_color_hex(C_SESSION), LV_PART_INDICATOR);
-    lv_obj_set_style_arc_width(g_arc_session, 8, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_width(g_arc_session, 10, LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(g_arc_session, LV_OPA_TRANSP, LV_PART_KNOB);
 
-    // Percentagem centralizada no arco — branco, montserrat_20
+    // % sessão — centralizado dentro do arco
     g_lbl_session_pct = lv_label_create(scr);
     lv_label_set_text(g_lbl_session_pct, "--");
-    lv_obj_set_size(g_lbl_session_pct, 60, 24);
-    lv_obj_set_pos(g_lbl_session_pct, ARC_S_X - 30, ARC_S_Y - 12);
+    lv_obj_set_size(g_lbl_session_pct, 80, 28);
+    lv_obj_set_pos(g_lbl_session_pct, ARC_S_X - 40, ARC_S_Y - 14);
     lv_obj_set_style_text_align(g_lbl_session_pct, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(g_lbl_session_pct, lv_color_hex(C_WHITE), 0);
     lv_obj_set_style_text_font(g_lbl_session_pct, &lv_font_montserrat_20, 0);
 
-    // "SESSION" label — centralizado abaixo do arco
+    // "SESSION" — centralizado abaixo do arco
     g_lbl_session_label = lv_label_create(scr);
     lv_label_set_text(g_lbl_session_label, "SESSION");
-    lv_obj_set_size(g_lbl_session_label, 72, 10);
+    lv_obj_set_size(g_lbl_session_label, LCD_W, 10);
+    lv_obj_set_pos(g_lbl_session_label, 0, 105);
     lv_obj_set_style_text_align(g_lbl_session_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(g_lbl_session_label, lv_color_hex(C_LABEL), 0);
     lv_obj_set_style_text_font(g_lbl_session_label, &lv_font_montserrat_8, 0);
-    lv_obj_align_to(g_lbl_session_label, g_arc_session, LV_ALIGN_OUT_BOTTOM_MID, 0, 3);
 
-    // Tempo de reset da sessão — centralizado abaixo do label
+    // Tempo de reset sessão — laranja, centralizado, font_14
+    // Termina em y=115+14=129; divider em y=131
     g_lbl_session_reset = lv_label_create(scr);
     lv_label_set_text(g_lbl_session_reset, "--");
-    lv_obj_set_size(g_lbl_session_reset, 72, 10);
+    lv_obj_set_size(g_lbl_session_reset, LCD_W, 18);
+    lv_obj_set_pos(g_lbl_session_reset, 0, 115);
     lv_obj_set_style_text_align(g_lbl_session_reset, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(g_lbl_session_reset, lv_color_hex(C_SESSION), 0);
-    lv_obj_set_style_text_font(g_lbl_session_reset, &lv_font_montserrat_8, 0);
-    lv_obj_align_to(g_lbl_session_reset, g_lbl_session_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_text_font(g_lbl_session_reset, &lv_font_montserrat_14, 0);
 
-    // ── Arc semanal — círculo completo, branco ───────────────────────
-    // Centro: x=110, y=50; raio=14
-    const int ARC_W_X = 110, ARC_W_Y = 50, ARC_W_R = 14;
+    // ── Linha divisória horizontal ───────────────────────────────────
+    lv_obj_t *hdiv = lv_obj_create(scr);
+    lv_obj_set_pos(hdiv, 0, 131);
+    lv_obj_set_size(hdiv, LCD_W, 1);
+    lv_obj_set_style_bg_color(hdiv, lv_color_hex(C_DIV), 0);
+    lv_obj_set_style_bg_opa(hdiv, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(hdiv, 0, 0);
+    lv_obj_set_style_radius(hdiv, 0, 0);
+
+    // ── Linha divisória vertical (weekly | extra) ────────────────────
+    lv_obj_t *vdiv = lv_obj_create(scr);
+    lv_obj_set_pos(vdiv, 64, 132);
+    lv_obj_set_size(vdiv, 1, LCD_H - 132);
+    lv_obj_set_style_bg_color(vdiv, lv_color_hex(C_DIV), 0);
+    lv_obj_set_style_bg_opa(vdiv, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(vdiv, 0, 0);
+    lv_obj_set_style_radius(vdiv, 0, 0);
+
+    // ── Bottom-left: arc weekly + labels ─────────────────────────────
+    // Arc: centro (15, 146), raio=11  → pos(4, 135) size 22×22
+    const int ARC_W_X = 15, ARC_W_Y = 146, ARC_W_R = 11;
 
     g_arc_weekly = lv_arc_create(scr);
-    lv_obj_remove_style_all(g_arc_weekly);  // remove tema padrão
+    lv_obj_remove_style_all(g_arc_weekly);
     lv_obj_set_size(g_arc_weekly, ARC_W_R * 2, ARC_W_R * 2);
     lv_obj_set_pos(g_arc_weekly, ARC_W_X - ARC_W_R, ARC_W_Y - ARC_W_R);
     lv_arc_set_rotation(g_arc_weekly, 270);
@@ -473,61 +489,44 @@ static void ui_create() {
 
     lv_obj_set_style_arc_color(g_arc_weekly, lv_color_hex(C_ARC_BG), LV_PART_MAIN);
     lv_obj_set_style_arc_width(g_arc_weekly, 4, LV_PART_MAIN);
-    lv_obj_set_style_arc_color(g_arc_weekly, lv_color_hex(C_WHITE), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(g_arc_weekly, lv_color_hex(C_WEEKLY), LV_PART_INDICATOR);
     lv_obj_set_style_arc_width(g_arc_weekly, 4, LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(g_arc_weekly, LV_OPA_TRANSP, LV_PART_KNOB);
 
-    // "WEEKLY" — alinhado à direita
     lv_obj_t *lbl_semanal = lv_label_create(scr);
     lv_label_set_text(lbl_semanal, "WEEKLY");
-    lv_obj_set_size(lbl_semanal, 60, 10);
-    lv_obj_set_pos(lbl_semanal, 97, 31);
-    lv_obj_set_style_text_align(lbl_semanal, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_size(lbl_semanal, 33, 10);
+    lv_obj_set_pos(lbl_semanal, 29, 132);
     lv_obj_set_style_text_color(lbl_semanal, lv_color_hex(C_LABEL), 0);
     lv_obj_set_style_text_font(lbl_semanal, &lv_font_montserrat_8, 0);
 
-    // % semanal — fora do arco, entre "WEEKLY" e o horário, alinhado à direita
     g_lbl_weekly_pct = lv_label_create(scr);
     lv_label_set_text(g_lbl_weekly_pct, "--");
-    lv_obj_set_size(g_lbl_weekly_pct, 60, 14);
-    lv_obj_set_pos(g_lbl_weekly_pct, 97, 43);
-    lv_obj_set_style_text_align(g_lbl_weekly_pct, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_size(g_lbl_weekly_pct, 33, 12);
+    lv_obj_set_pos(g_lbl_weekly_pct, 29, 140);
     lv_obj_set_style_text_color(g_lbl_weekly_pct, lv_color_hex(C_WHITE), 0);
     lv_obj_set_style_text_font(g_lbl_weekly_pct, &lv_font_montserrat_12, 0);
 
-    // Horário do reset semanal — alinhado à direita, formato HH:MM
+    // Abaixo do arco, largura total do painel esquerdo: "MON 09:00"
     g_lbl_weekly_reset = lv_label_create(scr);
     lv_label_set_text(g_lbl_weekly_reset, "--:--");
-    lv_obj_set_size(g_lbl_weekly_reset, 60, 10);
-    lv_obj_set_pos(g_lbl_weekly_reset, 97, 60);
-    lv_obj_set_style_text_align(g_lbl_weekly_reset, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_size(g_lbl_weekly_reset, 57, 10);
+    lv_obj_set_pos(g_lbl_weekly_reset, 4, 152);
     lv_obj_set_style_text_color(g_lbl_weekly_reset, lv_color_hex(C_TEXT), 0);
     lv_obj_set_style_text_font(g_lbl_weekly_reset, &lv_font_montserrat_8, 0);
 
-    // ── Linha divisória entre WEEKLY e EXTRA ─────────────────────────
-    lv_obj_t *hdiv = lv_obj_create(scr);
-    lv_obj_set_pos(hdiv, 97, 73);
-    lv_obj_set_size(hdiv, 60, 1);
-    lv_obj_set_style_bg_color(hdiv, lv_color_hex(C_DIV), 0);
-    lv_obj_set_style_bg_opa(hdiv, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(hdiv, 0, 0);
-    lv_obj_set_style_radius(hdiv, 0, 0);
-
-    // ── EXTRA — mesmo padrão que WEEKLY ─────────────────────────────
+    // ── Bottom-right: EXTRA + balance ────────────────────────────────
     lv_obj_t *lbl_extra = lv_label_create(scr);
     lv_label_set_text(lbl_extra, "EXTRA");
-    lv_obj_set_size(lbl_extra, 60, 10);
-    lv_obj_set_pos(lbl_extra, 97, 76);
-    lv_obj_set_style_text_align(lbl_extra, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_size(lbl_extra, 55, 10);
+    lv_obj_set_pos(lbl_extra, 68, 132);
     lv_obj_set_style_text_color(lbl_extra, lv_color_hex(C_LABEL), 0);
     lv_obj_set_style_text_font(lbl_extra, &lv_font_montserrat_8, 0);
 
-    // Saldo extra — alinhado à direita, fonte menor
     g_lbl_balance = lv_label_create(scr);
     lv_label_set_text(g_lbl_balance, "--");
-    lv_obj_set_size(g_lbl_balance, 60, 16);
-    lv_obj_set_pos(g_lbl_balance, 97, 89);
-    lv_obj_set_style_text_align(g_lbl_balance, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_size(g_lbl_balance, 55, 18);
+    lv_obj_set_pos(g_lbl_balance, 68, 144);
     lv_obj_set_style_text_color(g_lbl_balance, lv_color_hex(C_GREEN), 0);
     lv_obj_set_style_text_font(g_lbl_balance, &lv_font_montserrat_14, 0);
 }
@@ -736,7 +735,7 @@ extern "C" void app_main() {
     gpio_set_level((gpio_num_t)GPIO_RST, 1);
 
     st7735_init();
-    ESP_LOGI(TAG, "ST7735 OK (landscape 160x128)");
+    ESP_LOGI(TAG, "ST7735 OK (portrait 128x160)");
 
     // ── LVGL ───────────────────────────────────────────────────────
     const lvgl_port_cfg_t lvgl_cfg = ESP_LVGL_PORT_INIT_CONFIG();
