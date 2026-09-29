@@ -4,7 +4,7 @@
  *
  * Layout: topbar | arc sessão grande | seção semanal+extra
  * Dados via https://watch.jimmylab.com.br/usage (ver /proxy/server.py).
- * Credenciais em secrets.h (fora do Git) — copie secrets.h.example.
+ * FOTA pelo mesmo host (ver ota.h). Credenciais em secrets.h (fora do Git).
  */
 
 #include <cstdio>
@@ -22,7 +22,7 @@
 #include "esp_netif.h"
 #include "nvs_flash.h"
 #include "esp_http_client.h"
-#include "esp_crt_bundle.h"
+#include "esp_app_desc.h"
 #include "esp_timer.h"
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
@@ -34,17 +34,9 @@
 #include "lvgl.h"
 #include "esp_lvgl_port.h"
 
-// ─── CONFIGURAÇÃO ──────────────────────────────────────────────────
-#if !__has_include("secrets.h")
-#error "Crie firmware/main/secrets.h a partir de secrets.h.example"
-#endif
-#include "secrets.h"   // WIFI_SSID, WIFI_PASS, CF_ACCESS_CLIENT_ID/SECRET
-
-#ifndef PROXY_URL
-#define PROXY_URL      "https://watch.jimmylab.com.br/usage"
-#endif
-#define HTTP_TIMEOUT_MS 15000   // handshake TLS no C3 leva alguns segundos
-#define REFRESH_SEC    60
+#include "app_config.h"   // URLs, intervalos e secrets.h
+#include "ota.h"
+#include "watch_http.h"
 
 // ─── PINOS ─────────────────────────────────────────────────────────
 #define GPIO_MOSI     1
@@ -125,6 +117,19 @@ static lv_obj_t *g_lbl_balance;
 static lv_obj_t *g_dot_heartbeat;
 static lv_obj_t *g_wifi_bars[3];
 static lv_obj_t *g_lbl_bat;
+static lv_obj_t *g_lbl_banner;   // OTA / recuperação — oculto normalmente
+
+// ─── Autoteste (rollback de OTA) ────────────────────────────────────
+// Só critérios LOCAIS; rede/servidor apenas são registrados no log.
+static struct {
+    bool nvs_ok;
+    bool display_ok;
+    bool wifi_stack_ok;
+    bool tasks_ok;
+} g_selftest;
+static volatile uint32_t g_flush_count = 0;
+static volatile uint32_t g_lvgl_loops  = 0;
+static volatile bool     g_last_fetch_ok = false;
 
 // ─── ADC bateria ─────────────────────────────────────────────────────
 static adc_oneshot_unit_handle_t g_adc_handle;
@@ -235,6 +240,7 @@ static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px
     t.tx_buffer = px_map;
     t.user      = (void *)1;
     spi_device_polling_transmit(g_spi, &t);
+    g_flush_count = g_flush_count + 1;
 
     lv_display_flush_ready(disp);
 }
@@ -306,31 +312,22 @@ static void fmt_reset(char *buf, size_t sz, int secs) {
 }
 
 static bool fetch_usage() {
+    // OTA em andamento usa a rede — pula este ciclo
+    if (!watch_http_lock(0)) return false;
+
     g_http_len = 0;
     memset(g_http_buf, 0, sizeof(g_http_buf));
 
-    esp_http_client_config_t cfg = {};
-    cfg.url               = PROXY_URL;
-    cfg.timeout_ms        = HTTP_TIMEOUT_MS;
-    cfg.event_handler     = http_event_handler;
-    cfg.crt_bundle_attach = esp_crt_bundle_attach;   // CA bundle do ESP-IDF
-    cfg.user_agent        = "ClaudeMeter-ESP32/1.0";
-
-    esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    if (!client) return false;
-
-    // Cloudflare Access Service Token (vazio = não envia)
-    if (CF_ACCESS_CLIENT_ID[0] != '\0') {
-        esp_http_client_set_header(client, "CF-Access-Client-Id",     CF_ACCESS_CLIENT_ID);
-        esp_http_client_set_header(client, "CF-Access-Client-Secret", CF_ACCESS_CLIENT_SECRET);
-    }
+    esp_http_client_handle_t client = watch_http_client(USAGE_URL, http_event_handler);
+    if (!client) { watch_http_unlock(); return false; }
 
     esp_err_t err = esp_http_client_perform(client);
     int status    = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
+    watch_http_unlock();
 
     if (err != ESP_OK || status != 200) {
-        ESP_LOGW(TAG, "GET %s falhou: %s, HTTP %d", PROXY_URL, esp_err_to_name(err), status);
+        ESP_LOGW(TAG, "GET %s falhou: %s, HTTP %d", USAGE_URL, esp_err_to_name(err), status);
         return false;
     }
 
@@ -541,6 +538,32 @@ static void ui_create() {
     lv_obj_set_pos(g_lbl_balance, 72, 144);
     lv_obj_set_style_text_color(g_lbl_balance, lv_color_hex(C_GREEN), 0);
     lv_obj_set_style_text_font(g_lbl_balance, &lv_font_montserrat_14, 0);
+
+    // ── Banner OTA / recuperação — sobreposto ao arco, oculto ────────
+    g_lbl_banner = lv_label_create(scr);
+    lv_obj_set_pos(g_lbl_banner, 0, 18);
+    lv_obj_set_size(g_lbl_banner, LCD_W, 40);
+    lv_obj_set_style_bg_color(g_lbl_banner, lv_color_hex(C_TOPBAR), 0);
+    lv_obj_set_style_bg_opa(g_lbl_banner, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(g_lbl_banner, lv_color_hex(C_WHITE), 0);
+    lv_obj_set_style_text_font(g_lbl_banner, &lv_font_montserrat_8, 0);
+    lv_obj_set_style_text_align(g_lbl_banner, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_pad_top(g_lbl_banner, 4, 0);
+    lv_label_set_long_mode(g_lbl_banner, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(g_lbl_banner, "");
+    lv_obj_add_flag(g_lbl_banner, LV_OBJ_FLAG_HIDDEN);
+}
+
+// Mostra texto no banner (nullptr = esconde). Chamado de qualquer task.
+static void ui_banner(const char *text) {
+    if (!g_lbl_banner || !lvgl_port_lock(500)) return;
+    if (text) {
+        lv_label_set_text(g_lbl_banner, text);
+        lv_obj_clear_flag(g_lbl_banner, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(g_lbl_banner, LV_OBJ_FLAG_HIDDEN);
+    }
+    lvgl_port_unlock();
 }
 
 static void ui_update() {
@@ -612,7 +635,7 @@ static void fetch_task(void *) {
     vTaskDelay(pdMS_TO_TICKS(1000));
 
     while (true) {
-        fetch_usage();
+        g_last_fetch_ok = fetch_usage();
 
         if (lvgl_port_lock(100)) {
             ui_update();
@@ -709,14 +732,80 @@ static void battery_task(void *) {
     }
 }
 
+// ════════════════════ AUTOTESTE / OTA ══════════════════════════════
+
+// Grava e relê um valor na NVS (só quando a imagem está pendente).
+static bool nvs_selftest() {
+    nvs_handle_t h;
+    if (nvs_open("selftest", NVS_READWRITE, &h) != ESP_OK) return false;
+    uint32_t boots = 0;
+    nvs_get_u32(h, "boots", &boots);
+    bool ok = nvs_set_u32(h, "boots", boots + 1) == ESP_OK && nvs_commit(h) == ESP_OK;
+    uint32_t check = 0;
+    ok = ok && nvs_get_u32(h, "boots", &check) == ESP_OK && check == boots + 1;
+    nvs_close(h);
+    return ok;
+}
+
+// Bateria ≥ OTA_MIN_BATTERY_PCT ou carregando. Interromper o download é
+// seguro (a partição em uso não é tocada), então após 24 h de adiamentos
+// a atualização prossegue mesmo assim — a leitura de bateria é heurística.
+static bool ota_can_update() {
+    static int battery_skips = 0;
+    if (!g_wifi_ok) return false;
+
+    bool bat_ok = true;
+    if (xSemaphoreTake(g_bat_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+        bat_ok = g_bat.charging || g_bat.pct >= OTA_MIN_BATTERY_PCT;
+        xSemaphoreGive(g_bat_lock);
+    }
+    if (bat_ok || ++battery_skips >= 24 * 3600 / OTA_RETRY_SEC) {
+        battery_skips = 0;
+        return true;
+    }
+    ESP_LOGI(TAG, "OTA adiado: bateria baixa");
+    return false;
+}
+
+static void selftest_task(void *) {
+    uint32_t loops0 = g_lvgl_loops;
+    vTaskDelay(pdMS_TO_TICKS(SELFTEST_STABLE_SEC * 1000));
+
+    bool lvgl_alive = g_lvgl_loops != loops0;
+    bool display    = g_selftest.display_ok && g_flush_count > 0;
+    bool nvs        = g_selftest.nvs_ok && (!ota_pending_verify() || nvs_selftest());
+
+    const char *reason = !nvs                      ? "NVS"            :
+                         !display                  ? "display"        :
+                         !g_selftest.wifi_stack_ok ? "Wi-Fi stack"    :
+                         !g_selftest.tasks_ok      ? "tasks"          :
+                         !lvgl_alive               ? "LVGL parado"    : "";
+    bool healthy = reason[0] == '\0';
+
+    // Informativo apenas — indisponibilidade externa não rejeita a imagem
+    ESP_LOGI(TAG, "autoteste: local=%s | wifi=%s | watch /usage=%s",
+             healthy ? "OK" : reason, g_wifi_ok ? "conectado" : "sem conexão",
+             g_last_fetch_ok ? "OK" : "sem resposta");
+
+    ota_selftest_result(healthy, reason);   // pendente + falha → rollback (não retorna)
+
+    static const ota_hooks_t hooks = { ota_can_update, ui_banner };
+    ota_start(&hooks);
+    vTaskDelete(nullptr);
+}
+
 // ════════════════════ APP MAIN ════════════════════════════════════
 
 extern "C" void app_main() {
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase();
-        nvs_flash_init();
+        ret = nvs_flash_init();
     }
+    g_selftest.nvs_ok = ret == ESP_OK;
+
+    ota_boot_init();
+    watch_http_init();
 
     g_usage_lock = xSemaphoreCreateMutex();
     g_bat_lock   = xSemaphoreCreateMutex();
@@ -774,24 +863,30 @@ extern "C" void app_main() {
         esp_timer_start_periodic(th, 5000);
     }
 
-    if (lvgl_port_lock(0)) {
+    if (lvgl_port_lock(0)) {   // 0 = espera indefinida (esp_lvgl_port)
         ui_create();
         lvgl_port_unlock();
+        g_selftest.display_ok = true;
     }
 
     wifi_init();
+    g_selftest.wifi_stack_ok = true;   // falhas acima abortam (panic → rollback)
 
     // LVGL handler task
-    xTaskCreate([](void*) {
+    bool t_ok = xTaskCreate([](void*) {
         while (true) {
             if (lvgl_port_lock(10)) { lv_timer_handler(); lvgl_port_unlock(); }
+            g_lvgl_loops = g_lvgl_loops + 1;
             vTaskDelay(pdMS_TO_TICKS(10));
         }
-    }, "lvgl", 8192, nullptr, 4, nullptr);
+    }, "lvgl", 8192, nullptr, 4, nullptr) == pdPASS;
 
-    xTaskCreate(fetch_task,     "fetch",  8192, nullptr, 5, nullptr);
-    xTaskCreate(heartbeat_task, "hbeat",  2048, nullptr, 3, nullptr);
-    xTaskCreate(battery_task,   "bat",    3072, nullptr, 3, nullptr);
+    t_ok &= xTaskCreate(fetch_task,     "fetch",  8192, nullptr, 5, nullptr) == pdPASS;
+    t_ok &= xTaskCreate(heartbeat_task, "hbeat",  2048, nullptr, 3, nullptr) == pdPASS;
+    t_ok &= xTaskCreate(battery_task,   "bat",    3072, nullptr, 3, nullptr) == pdPASS;
+    g_selftest.tasks_ok = t_ok;
 
-    ESP_LOGI(TAG, "ClaudeMeter iniciado");
+    xTaskCreate(selftest_task, "selftest", 4096, nullptr, 2, nullptr);
+
+    ESP_LOGI(TAG, "ClaudeMeter %s iniciado", esp_app_get_description()->version);
 }

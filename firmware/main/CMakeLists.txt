@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "main.cpp"
+    SRCS "ota.cpp" "watch_http.cpp" "main.cpp"
     INCLUDE_DIRS "."
     REQUIRES
         nvs_flash
@@ -9,6 +9,8 @@ idf_component_register(
         esp_http_client
         esp-tls
         mbedtls
+        app_update
+        esp_app_format
         driver
         esp_timer
         esp_adc
