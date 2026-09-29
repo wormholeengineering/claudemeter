@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "ota.cpp" "watch_http.cpp" "main.cpp"
+    SRCS "wifi_mgr.cpp" "ota.cpp" "watch_http.cpp" "main.cpp"
     INCLUDE_DIRS "."
     REQUIRES
         nvs_flash
@@ -7,6 +7,7 @@ idf_component_register(
         esp_event
         esp_netif
         esp_http_client
+        esp_http_server
         esp-tls
         mbedtls
         app_update

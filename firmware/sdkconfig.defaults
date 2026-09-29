@@ -11,7 +11,8 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_PARTITION_TABLE_OFFSET=0x8000
 
 # ── WiFi ──────────────────────────────────────────────────────────
-CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n
+# SoftAP só para o modo de recuperação (15 min sem nenhuma rede)
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
 
 # ── LVGL ─────────────────────────────────────────────────────────
 # Usa Kconfig em vez de lv_conf.h

@@ -37,6 +37,7 @@
 #include "app_config.h"   // URLs, intervalos e secrets.h
 #include "ota.h"
 #include "watch_http.h"
+#include "wifi_mgr.h"
 
 // ─── PINOS ─────────────────────────────────────────────────────────
 #define GPIO_MOSI     1
@@ -91,12 +92,6 @@ typedef struct {
 
 static claude_usage_t g_usage = {0, 0, -1, -1, -1, "", "", false};
 static SemaphoreHandle_t g_usage_lock;
-
-// ─── WiFi ───────────────────────────────────────────────────────────
-#define WIFI_CONNECTED_BIT BIT0
-#define WIFI_FAIL_BIT      BIT1
-static EventGroupHandle_t g_wifi_events;
-static bool g_wifi_ok = false;
 
 // ─── LVGL globals ───────────────────────────────────────────────────
 static lv_display_t      *g_disp = nullptr;
@@ -243,46 +238,6 @@ static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px
     g_flush_count = g_flush_count + 1;
 
     lv_display_flush_ready(disp);
-}
-
-// ════════════════════ WiFi ══════════════════════════════════════════
-
-static void wifi_event_handler(void *arg, esp_event_base_t base,
-                               int32_t id, void *data) {
-    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        g_wifi_ok = false;
-        xEventGroupSetBits(g_wifi_events, WIFI_FAIL_BIT);
-        vTaskDelay(pdMS_TO_TICKS(3000));
-        esp_wifi_connect();
-    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
-        g_wifi_ok = true;
-        xEventGroupSetBits(g_wifi_events, WIFI_CONNECTED_BIT);
-    }
-}
-
-static void wifi_init() {
-    g_wifi_events = xEventGroupCreate();
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    esp_event_handler_instance_t h1, h2;
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                                        &wifi_event_handler, nullptr, &h1));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                                        &wifi_event_handler, nullptr, &h2));
-
-    wifi_config_t wcfg = {};
-    strncpy((char*)wcfg.sta.ssid,     WIFI_SSID, sizeof(wcfg.sta.ssid) - 1);
-    strncpy((char*)wcfg.sta.password, WIFI_PASS,  sizeof(wcfg.sta.password) - 1);
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wcfg));
-    ESP_ERROR_CHECK(esp_wifi_start());
 }
 
 // ════════════════════ HTTP FETCH ════════════════════════════════════
@@ -622,7 +577,7 @@ static void ui_update() {
     }
 
     // WiFi bars
-    lv_color_t wc = g_wifi_ok ? lv_color_hex(C_GREEN) : lv_color_hex(0x4A1A1A);
+    lv_color_t wc = wifi_mgr_connected() ? lv_color_hex(C_GREEN) : lv_color_hex(0x4A1A1A);
     for (int i = 0; i < 3; i++)
         lv_obj_set_style_bg_color(g_wifi_bars[i], wc, 0);
 }
@@ -630,8 +585,7 @@ static void ui_update() {
 // ════════════════════ TASKS ════════════════════════════════════════
 
 static void fetch_task(void *) {
-    xEventGroupWaitBits(g_wifi_events, WIFI_CONNECTED_BIT,
-                        pdFALSE, pdFALSE, portMAX_DELAY);
+    wifi_mgr_wait_connected(portMAX_DELAY);
     vTaskDelay(pdMS_TO_TICKS(1000));
 
     while (true) {
@@ -752,7 +706,7 @@ static bool nvs_selftest() {
 // a atualização prossegue mesmo assim — a leitura de bateria é heurística.
 static bool ota_can_update() {
     static int battery_skips = 0;
-    if (!g_wifi_ok) return false;
+    if (!wifi_mgr_connected()) return false;
 
     bool bat_ok = true;
     if (xSemaphoreTake(g_bat_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -784,7 +738,7 @@ static void selftest_task(void *) {
 
     // Informativo apenas — indisponibilidade externa não rejeita a imagem
     ESP_LOGI(TAG, "autoteste: local=%s | wifi=%s | watch /usage=%s",
-             healthy ? "OK" : reason, g_wifi_ok ? "conectado" : "sem conexão",
+             healthy ? "OK" : reason, wifi_mgr_connected() ? "conectado" : "sem conexão",
              g_last_fetch_ok ? "OK" : "sem resposta");
 
     ota_selftest_result(healthy, reason);   // pendente + falha → rollback (não retorna)
@@ -869,8 +823,10 @@ extern "C" void app_main() {
         g_selftest.display_ok = true;
     }
 
-    wifi_init();
-    g_selftest.wifi_stack_ok = true;   // falhas acima abortam (panic → rollback)
+    // Wi-Fi: lista de redes + SoftAP de recuperação após 15 min sem conexão
+    esp_err_t wifi_err = wifi_mgr_start(ui_banner);
+    g_selftest.wifi_stack_ok = wifi_err == ESP_OK;
+    if (wifi_err != ESP_OK) ESP_LOGE(TAG, "Wi-Fi: %s", esp_err_to_name(wifi_err));
 
     // LVGL handler task
     bool t_ok = xTaskCreate([](void*) {
