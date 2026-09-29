@@ -28,3 +28,9 @@ CONFIG_LV_USE_OBJ=y
 
 # ── Logs ──────────────────────────────────────────────────────────
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# ── TLS (https://watch.jimmylab.com.br) ───────────────────────────
+# Bundle de CAs do ESP-IDF usado por esp_crt_bundle_attach
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+CONFIG_ESP_TLS_USING_MBEDTLS=y

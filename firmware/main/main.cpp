@@ -3,7 +3,8 @@
  * ESP32-C3 Super Mini + ST7735 1.8" SPI (128×160 portrait)
  *
  * Layout: topbar | arc sessão grande | seção semanal+extra
- * Dados via proxy HTTP local (ver /proxy/server.py).
+ * Dados via https://watch.jimmylab.com.br/usage (ver /proxy/server.py).
+ * Credenciais em secrets.h (fora do Git) — copie secrets.h.example.
  */
 
 #include <cstdio>
@@ -21,6 +22,7 @@
 #include "esp_netif.h"
 #include "nvs_flash.h"
 #include "esp_http_client.h"
+#include "esp_crt_bundle.h"
 #include "esp_timer.h"
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
@@ -33,9 +35,15 @@
 #include "esp_lvgl_port.h"
 
 // ─── CONFIGURAÇÃO ──────────────────────────────────────────────────
-#define WIFI_SSID      "BRARUS_IoT"
-#define WIFI_PASS      "L4c3rd4S4r4c*"
-#define PROXY_URL      "http://192.168.68.108:8000/usage"
+#if !__has_include("secrets.h")
+#error "Crie firmware/main/secrets.h a partir de secrets.h.example"
+#endif
+#include "secrets.h"   // WIFI_SSID, WIFI_PASS, CF_ACCESS_CLIENT_ID/SECRET
+
+#ifndef PROXY_URL
+#define PROXY_URL      "https://watch.jimmylab.com.br/usage"
+#endif
+#define HTTP_TIMEOUT_MS 15000   // handshake TLS no C3 leva alguns segundos
 #define REFRESH_SEC    60
 
 // ─── PINOS ─────────────────────────────────────────────────────────
@@ -187,8 +195,8 @@ static void st7735_init() {
 
     st7735_cmd(0x20);  // INVOFF
 
-    // Portrait: sem mirror/swap, BGR=0
-    st7735_cmd(0x36); st7735_data1(0x00);
+    // Portrait 180°: MY=1, MX=1, BGR=0
+    st7735_cmd(0x36); st7735_data1(0xC0);
     st7735_cmd(0x3A); st7735_data1(0x05);  // COLMOD 16-bit
 
     // Área GREENTAB em landscape (x offset=1, y offset=2)
@@ -302,18 +310,29 @@ static bool fetch_usage() {
     memset(g_http_buf, 0, sizeof(g_http_buf));
 
     esp_http_client_config_t cfg = {};
-    cfg.url           = PROXY_URL;
-    cfg.timeout_ms    = 8000;
-    cfg.event_handler = http_event_handler;
+    cfg.url               = PROXY_URL;
+    cfg.timeout_ms        = HTTP_TIMEOUT_MS;
+    cfg.event_handler     = http_event_handler;
+    cfg.crt_bundle_attach = esp_crt_bundle_attach;   // CA bundle do ESP-IDF
+    cfg.user_agent        = "ClaudeMeter-ESP32/1.0";
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) return false;
+
+    // Cloudflare Access Service Token (vazio = não envia)
+    if (CF_ACCESS_CLIENT_ID[0] != '\0') {
+        esp_http_client_set_header(client, "CF-Access-Client-Id",     CF_ACCESS_CLIENT_ID);
+        esp_http_client_set_header(client, "CF-Access-Client-Secret", CF_ACCESS_CLIENT_SECRET);
+    }
 
     esp_err_t err = esp_http_client_perform(client);
     int status    = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
 
-    if (err != ESP_OK || status != 200) return false;
+    if (err != ESP_OK || status != 200) {
+        ESP_LOGW(TAG, "GET %s falhou: %s, HTTP %d", PROXY_URL, esp_err_to_name(err), status);
+        return false;
+    }
 
     cJSON *root = cJSON_ParseWithLength(g_http_buf, g_http_len);
     if (!root) return false;
@@ -358,6 +377,7 @@ static void ui_create() {
     lv_obj_t *scr = lv_screen_active();
     lv_obj_set_style_bg_color(scr, lv_color_hex(C_BG), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+    lv_obj_set_scrollbar_mode(scr, LV_SCROLLBAR_MODE_OFF);
 
     // ── Top bar (18px) ───────────────────────────────────────────────
     lv_obj_t *topbar = lv_obj_create(scr);
@@ -368,6 +388,7 @@ static void ui_create() {
     lv_obj_set_style_border_width(topbar, 0, 0);
     lv_obj_set_style_pad_all(topbar, 0, 0);
     lv_obj_set_style_radius(topbar, 0, 0);
+    lv_obj_set_scrollbar_mode(topbar, LV_SCROLLBAR_MODE_OFF);
 
     // Barras WiFi
     for (int i = 0; i < 3; i++) {
@@ -464,15 +485,6 @@ static void ui_create() {
     lv_obj_set_style_border_width(hdiv, 0, 0);
     lv_obj_set_style_radius(hdiv, 0, 0);
 
-    // ── Linha divisória vertical (weekly | extra) ────────────────────
-    lv_obj_t *vdiv = lv_obj_create(scr);
-    lv_obj_set_pos(vdiv, 64, 132);
-    lv_obj_set_size(vdiv, 1, LCD_H - 132);
-    lv_obj_set_style_bg_color(vdiv, lv_color_hex(C_DIV), 0);
-    lv_obj_set_style_bg_opa(vdiv, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(vdiv, 0, 0);
-    lv_obj_set_style_radius(vdiv, 0, 0);
-
     // ── Bottom-left: arc weekly + labels ─────────────────────────────
     // Arc: centro (15, 146), raio=11  → pos(4, 135) size 22×22
     const int ARC_W_X = 15, ARC_W_Y = 146, ARC_W_R = 11;
@@ -495,38 +507,38 @@ static void ui_create() {
 
     lv_obj_t *lbl_semanal = lv_label_create(scr);
     lv_label_set_text(lbl_semanal, "WEEKLY");
-    lv_obj_set_size(lbl_semanal, 33, 10);
+    lv_obj_set_size(lbl_semanal, 40, 10);
     lv_obj_set_pos(lbl_semanal, 29, 132);
     lv_obj_set_style_text_color(lbl_semanal, lv_color_hex(C_LABEL), 0);
     lv_obj_set_style_text_font(lbl_semanal, &lv_font_montserrat_8, 0);
 
     g_lbl_weekly_pct = lv_label_create(scr);
     lv_label_set_text(g_lbl_weekly_pct, "--");
-    lv_obj_set_size(g_lbl_weekly_pct, 33, 12);
+    lv_obj_set_size(g_lbl_weekly_pct, 40, 12);
     lv_obj_set_pos(g_lbl_weekly_pct, 29, 140);
     lv_obj_set_style_text_color(g_lbl_weekly_pct, lv_color_hex(C_WHITE), 0);
     lv_obj_set_style_text_font(g_lbl_weekly_pct, &lv_font_montserrat_12, 0);
 
-    // Abaixo do arco, largura total do painel esquerdo: "MON 09:00"
+    // Alinhado com WEEKLY e % acima — mesmo x=29, até a divisória em x=70
     g_lbl_weekly_reset = lv_label_create(scr);
     lv_label_set_text(g_lbl_weekly_reset, "--:--");
-    lv_obj_set_size(g_lbl_weekly_reset, 57, 10);
-    lv_obj_set_pos(g_lbl_weekly_reset, 4, 152);
+    lv_obj_set_size(g_lbl_weekly_reset, 40, 10);
+    lv_obj_set_pos(g_lbl_weekly_reset, 29, 152);
     lv_obj_set_style_text_color(g_lbl_weekly_reset, lv_color_hex(C_TEXT), 0);
     lv_obj_set_style_text_font(g_lbl_weekly_reset, &lv_font_montserrat_8, 0);
 
-    // ── Bottom-right: EXTRA + balance ────────────────────────────────
+    // ── Bottom-right: EXTRA + balance — x=72, largura total até borda
     lv_obj_t *lbl_extra = lv_label_create(scr);
     lv_label_set_text(lbl_extra, "EXTRA");
     lv_obj_set_size(lbl_extra, 55, 10);
-    lv_obj_set_pos(lbl_extra, 68, 132);
+    lv_obj_set_pos(lbl_extra, 72, 132);
     lv_obj_set_style_text_color(lbl_extra, lv_color_hex(C_LABEL), 0);
     lv_obj_set_style_text_font(lbl_extra, &lv_font_montserrat_8, 0);
 
     g_lbl_balance = lv_label_create(scr);
     lv_label_set_text(g_lbl_balance, "--");
     lv_obj_set_size(g_lbl_balance, 55, 18);
-    lv_obj_set_pos(g_lbl_balance, 68, 144);
+    lv_obj_set_pos(g_lbl_balance, 72, 144);
     lv_obj_set_style_text_color(g_lbl_balance, lv_color_hex(C_GREEN), 0);
     lv_obj_set_style_text_font(g_lbl_balance, &lv_font_montserrat_14, 0);
 }
@@ -567,10 +579,12 @@ static void ui_update() {
         lv_label_set_text(g_lbl_weekly_pct, "--");
     }
 
-    // Reset semanal — horário local Brasília vindo direto do proxy
+    // Reset semanal — "MON 9:00" (sem zero à esquerda para caber no espaço)
     if (u.weekly_reset_day[0] != '\0') {
         const char *t = u.weekly_reset_time[0] ? u.weekly_reset_time : "--:--";
-        snprintf(buf, sizeof(buf), "%s %s", u.weekly_reset_day, t);
+        int h = 0, m = 0;
+        sscanf(t, "%d:%d", &h, &m);
+        snprintf(buf, sizeof(buf), "%s %d:%02d", u.weekly_reset_day, h, m);
     } else {
         snprintf(buf, sizeof(buf), "--:--");
     }

@@ -1,0 +1,46 @@
+# ClaudeMeter — deploy no JimmyLab (Raspberry Pi 5, ARM64)
+#
+#   https://watch.jimmylab.com.br → Cloudflare Tunnel "jimmylab" → cloudflared → [proxy] → claude-meter:8000
+#
+# Diretório no servidor: /docker/apps/claude-meter   (clone deste repositório)
+# Rede "proxy" é externa e já existe — não é criada aqui. Nenhuma porta é publicada no host.
+# Admin (cookies/refresh/balance): docker exec -i claude-meter python admin.py ...
+
+name: claude-meter
+
+networks:
+  proxy:
+    external: true
+
+services:
+  claude-meter:
+    build:
+      context: ./proxy
+    image: claude-meter:latest
+    container_name: claude-meter
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PYTHONUNBUFFERED: "1"
+      DATA_DIR: /data
+      TZ: ${TZ:-America/Porto_Velho}
+    volumes:
+      # claude_cookies.json — sessão do claude.ai, tratar como secret (dono UID 1000)
+      - ./data:/data
+    networks:
+      - proxy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -52,6 +52,7 @@ BROWSER_HEADERS = {
 
 def _save_cookies(cookies: list[dict]) -> None:
     COOKIES_FILE.write_text(json.dumps(cookies, indent=2))
+    COOKIES_FILE.chmod(0o600)  # sessão completa do claude.ai — tratar como secret
     log.info("Cookies salvos em %s", COOKIES_FILE)
 
 

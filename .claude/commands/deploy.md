@@ -8,8 +8,8 @@ Guia de referência rápida para build, flash, deploy no Pi e push ao GitHub.
 |------|-------|
 | ESP32 | C3 Super Mini, porta **COM12** |
 | Display | ST7735 1.8" GREENTAB, 128×160, SPI |
-| Pi | Raspberry Pi 5, IP `192.168.68.108`, usuário `pi` |
-| Proxy | `http://192.168.68.108:8000` |
+| Servidor | `jimmylab` — Raspberry Pi 5, `/docker/apps/claude-meter` |
+| Proxy | `https://watch.jimmylab.com.br` → tunnel jimmylab → `claude-meter:8000` (rede `proxy`) |
 | Repo | `https://github.com/wormholeengineering/claudemeter` |
 
 ---
@@ -44,13 +44,15 @@ $env:IDF_PYTHON_ENV_PATH = "C:\Espressif\python_env\idf5.5_py3.11_env"
 & $PYTHON "$IDF_PATH\tools\idf.py" --project-dir $PROJECT -p $PORT flash
 ```
 
-### Variáveis importantes no firmware (`main.cpp`)
+### Secrets do firmware (`firmware/main/secrets.h`, fora do Git)
 
-```cpp
-#define WIFI_SSID   "BRARUS_IoT"
-#define PROXY_URL   "http://192.168.68.108:8000/usage"
-#define REFRESH_SEC 60      // busca proxy a cada 60s
+```powershell
+Copy-Item firmware\main\secrets.h.example firmware\main\secrets.h
 ```
+
+`WIFI_SSID`, `WIFI_PASS`, `CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET`
+(Service Token do Cloudflare Access; vazio = não envia os headers).
+`PROXY_URL` padrão: `https://watch.jimmylab.com.br/usage` (TLS via certificate bundle do ESP-IDF).
 
 ### Pinos ST7735
 
@@ -77,53 +79,54 @@ lv_display_set_color_format(g_disp, LV_COLOR_FORMAT_RGB565_SWAPPED);
 
 ---
 
-## 2. Deploy do proxy (Raspberry Pi)
+## 2. Deploy do proxy (JimmyLab)
 
-### Enviar arquivos e rebuildar
+`/docker/apps/claude-meter` é um clone deste repositório; `compose.yaml` na raiz.
+Sem porta publicada — acesso só pela rede Docker `proxy` (cloudflared).
 
 ```bash
-scp proxy/server.py proxy/claude_auth.py proxy/requirements.txt \
-    proxy/Dockerfile proxy/docker-compose.yml \
-    pi:/home/pi/claudemeter/
-
-ssh pi "cd /home/pi/claudemeter && docker compose up -d --build"
+cd /docker/apps/claude-meter
+git pull
+cp -n .env.example .env                    # primeira vez
+mkdir -p data && sudo chown 1000:1000 data && chmod 700 data
+docker compose up -d --build
 ```
 
-### Verificar se está funcionando
+### Verificar
 
 ```bash
-ssh pi "curl -s http://localhost:8000/usage | python3 -m json.tool"
-ssh pi "docker logs claudemeter --tail=30"
+docker compose ps                                                     # healthy?
+docker logs claude-meter --tail=30
+docker exec claude-meter python -c "import urllib.request as u; print(u.urlopen('http://127.0.0.1:8000/usage').read().decode())"
+docker run --rm --network proxy busybox wget -qO- http://claude-meter:8000/health   # caminho do cloudflared
 ```
 
-### Forçar refresh dos dados
+### Administração (só de dentro do container)
+
+Endpoints administrativos (`/cookies`, `/cookies/status`, `/refresh`, `/balance`) só
+aceitam loopback, ou `Authorization: Bearer $ADMIN_TOKEN` se `ADMIN_TOKEN` estiver no `.env`.
+O Service Token do ESP32 **não** dá acesso a eles.
 
 ```bash
-ssh pi "curl -s -X POST http://localhost:8000/refresh"
+docker exec    claude-meter python admin.py status
+docker exec    claude-meter python admin.py refresh
+docker exec    claude-meter python admin.py balance 12.50
 ```
 
 ### Atualizar cookies do claude.ai (quando a sessão expirar)
 
 1. Instale a extensão **Cookie-Editor** no Chrome
 2. Acesse `claude.ai` (já logado)
-3. Cookie-Editor → Export → Export as JSON → copie
-4. Cole no comando:
+3. Cookie-Editor → Export → Export as JSON → salve como `cookies.json` no Pi
+4. Envie e apague o arquivo:
 
 ```bash
-curl -X POST http://192.168.68.108:8000/cookies \
-     -H "Content-Type: application/json" \
-     -d '<JSON_COPIADO>'
+docker exec -i claude-meter python admin.py cookies < cookies.json && shred -u cookies.json
 ```
 
-### Variáveis de ambiente (`.env` no Pi)
+### Variáveis de ambiente (`.env`, fora do Git)
 
-```bash
-# Opcional — intervalo entre scrapes (padrão 300s)
-SCRAPE_INTERVAL_SEC=300
-
-# Opcional — saldo extra manual (se não vier dos cookies)
-# CLAUDE_EXTRA_BALANCE=12.50
-```
+Ver `.env.example`: `TZ` (America/Porto_Velho), `SCRAPE_INTERVAL_SEC`, `CLAUDE_EXTRA_BALANCE`, `ADMIN_TOKEN`.
 
 ---
 
@@ -141,18 +144,19 @@ gh repo view --web
 
 ### O que NÃO commitar (já no .gitignore)
 
-- `proxy/.env` — contém segredos
-- `*.har` — contém cookies de sessão
+- `.env` — contém segredos
+- `data/`, `*cookies*.json`, `*.har` — cookies de sessão do claude.ai
+- `firmware/main/secrets.h` — Wi-Fi e Service Token
 - `firmware/build/` — artefatos de compilação
 - `firmware/managed_components/` — dependências baixadas
 - `firmware/sdkconfig` — gerado automaticamente
 
 ---
 
-## 4. Acesso SSH ao Pi
+## 4. Acesso SSH ao servidor
 
 ```bash
-ssh pi "docker ps"
-ssh pi "docker logs claudemeter --tail=50"
-ssh pi "curl -s http://localhost:8000/health"
+ssh jimmylab "docker ps"
+ssh jimmylab "docker logs claude-meter --tail=50"
+ssh jimmylab "docker inspect --format '{{.State.Health.Status}}' claude-meter"
 ```

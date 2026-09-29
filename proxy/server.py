@@ -5,17 +5,22 @@ ClaudeMeter Proxy
 Uso:
     uvicorn server:app --host 0.0.0.0 --port 8000
 
-Saldo extra manual:
-    POST /balance {"value": 12.50}
+Endpoints:
+    GET  /usage   — operacional (ESP32, via Cloudflare Access Service Token)
+    GET  /health  — healthcheck
+    Administrativos (/cookies, /cookies/status, /refresh, /balance) — só aceitos
+    de loopback (docker exec no container, ver admin.py) ou com
+    "Authorization: Bearer $ADMIN_TOKEN" quando ADMIN_TOKEN estiver definido.
 """
 
 import asyncio
+import hmac
 import logging
 import os
 import time
 from dataclasses import dataclass, field
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -24,10 +29,31 @@ from claude_auth import fetch_claude_usage, inject_cookies, _load_cookies, _cook
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("claudemeter")
 
-app = FastAPI(title="ClaudeMeter Proxy")
+# Sem /docs, /redoc e /openapi.json
+app = FastAPI(title="ClaudeMeter Proxy", docs_url=None, redoc_url=None, openapi_url=None)
 
 EXTRA_BALANCE   = float(os.environ.get("CLAUDE_EXTRA_BALANCE", "-1"))
 SCRAPE_INTERVAL = int(os.environ.get("SCRAPE_INTERVAL_SEC", "300"))  # 5 min
+ADMIN_TOKEN     = os.environ.get("ADMIN_TOKEN", "")
+
+
+# ── Autorização dos endpoints administrativos ─────────────────────────────────
+
+_LOOPBACK = {"127.0.0.1", "::1"}
+
+
+def require_admin(request: Request) -> None:
+    """
+    Loopback (docker exec) sempre passa. Fora disso, exige ADMIN_TOKEN —
+    o Service Token do ESP32 no Cloudflare Access não basta.
+    """
+    if request.client and request.client.host in _LOOPBACK:
+        return
+    if ADMIN_TOKEN:
+        auth = request.headers.get("authorization", "")
+        if auth.startswith("Bearer ") and hmac.compare_digest(auth[7:].encode(), ADMIN_TOKEN.encode()):
+            return
+    raise HTTPException(status_code=403, detail="forbidden")
 
 
 # ── Cache do último scrape ────────────────────────────────────────────────────
@@ -81,7 +107,7 @@ async def get_usage() -> JSONResponse:
 class BalanceUpdate(BaseModel):
     value: float
 
-@app.post("/balance")
+@app.post("/balance", dependencies=[Depends(require_admin)])
 async def set_balance(body: BalanceUpdate) -> dict:
     """Atualiza saldo extra manualmente."""
     global _manual_balance
@@ -90,7 +116,7 @@ async def set_balance(body: BalanceUpdate) -> dict:
     return {"ok": True, "extra_balance": _manual_balance}
 
 
-@app.post("/refresh")
+@app.post("/refresh", dependencies=[Depends(require_admin)])
 async def force_refresh() -> dict:
     """Força um novo scrape imediatamente (ignora cache)."""
     global _cache
@@ -98,7 +124,7 @@ async def force_refresh() -> dict:
     return {"ok": True, "message": "Cache invalidado — próxima chamada fará scrape"}
 
 
-@app.post("/cookies")
+@app.post("/cookies", dependencies=[Depends(require_admin)])
 async def upload_cookies(cookies: list[dict]) -> dict:
     """
     Recebe cookies exportados do browser (extensão Cookie-Editor) e os salva.
@@ -107,11 +133,9 @@ async def upload_cookies(cookies: list[dict]) -> dict:
       1. Instale a extensão "Cookie-Editor" no Chrome/Firefox
       2. Acesse claude.ai (já logado)
       3. Abra a extensão → Export → Export as JSON → copie o conteúdo
-      4. Cole no comando abaixo:
+      4. Salve em um arquivo no Pi e envie de dentro do container:
 
-         curl -X POST http://192.168.68.108:8000/cookies \\
-              -H "Content-Type: application/json" \\
-              -d '<JSON_COPIADO>'
+         docker exec -i claude-meter python admin.py cookies < cookies.json
     """
     ok = inject_cookies(cookies)
     global _cache
@@ -123,7 +147,7 @@ async def upload_cookies(cookies: list[dict]) -> dict:
     }
 
 
-@app.get("/cookies/status")
+@app.get("/cookies/status", dependencies=[Depends(require_admin)])
 async def cookies_status() -> dict:
     """Informa se há cookies salvos e válidos."""
     cookies = _load_cookies()

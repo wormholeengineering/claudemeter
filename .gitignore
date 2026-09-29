@@ -1,6 +1,18 @@
 # ── Segredos ──────────────────────────────────────────────────────
-proxy/.env
+# .env (servidor) — ADMIN_TOKEN etc.
+.env
+*.env
+!.env.example
+# Cookies de sessão do claude.ai (volume ./data e exports do Cookie-Editor)
+data/
+**/data/
+*cookies*.json
 *.har
+# Firmware: Wi-Fi e Cloudflare Access Service Token
+firmware/main/secrets.h
+secrets.h
+*service-token*
+*service_token*
 
 # ── Firmware build artifacts ──────────────────────────────────────
 firmware/build/
@@ -11,3 +23,6 @@ firmware/dependencies.lock
 
 # ── Editor ────────────────────────────────────────────────────────
 *.swp
+
+# ── Python ────────────────────────────────────────────────────────
+__pycache__/

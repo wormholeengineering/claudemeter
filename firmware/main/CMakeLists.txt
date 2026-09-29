@@ -7,6 +7,8 @@ idf_component_register(
         esp_event
         esp_netif
         esp_http_client
+        esp-tls
+        mbedtls
         driver
         esp_timer
         esp_adc
