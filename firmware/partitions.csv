@@ -1,4 +1,16 @@
-# Name,   Type, SubType, Offset,  Size, Flags
-nvs,      data, nvs,     0x9000,  0x5000,
-phy_init, data, phy,     0xe000,  0x1000,
-factory,  app,  factory, 0x10000, 0x1F0000,
+# ClaudeMeter — tabela OTA para flash de 4 MB
+#
+# ⚠ DEPENDE DE CONFIRMAÇÃO FÍSICA: rode `esptool flash_id` na gravação
+#   (tools/flash_device.py faz isso e aborta se não for 4 MB).
+#   Se a flash tiver só 2 MB, esta tabela NÃO cabe — não gravar, não apagar.
+#
+# Sem partição factory: o primeiro flash via USB grava ota_0.
+# Cada slot = 0x1F0000 (1.94 MB), mesmo tamanho da antiga factory.
+# 0x3F0000–0x400000 (64 KB) ficam livres (reserva p/ coredump futuro).
+#
+# Name,   Type, SubType, Offset,   Size,     Flags
+nvs,      data, nvs,     0x9000,   0x4000,
+otadata,  data, ota,     0xD000,   0x2000,
+phy_init, data, phy,     0xF000,   0x1000,
+ota_0,    app,  ota_0,   0x10000,  0x1F0000,
+ota_1,    app,  ota_1,   0x200000, 0x1F0000,

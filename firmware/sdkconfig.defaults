@@ -1,7 +1,11 @@
 # ── ESP32-C3 target ───────────────────────────────────────────────
 CONFIG_IDF_TARGET="esp32c3"
 
-# ── Partição customizada (factory 1.94 MB para caber LVGL) ────────
+# ── Flash / partições OTA ─────────────────────────────────────────
+# ⚠ 4 MB DEPENDE DE CONFIRMAÇÃO FÍSICA (esptool flash_id na gravação).
+#   Se o chip tiver só 2 MB: parar — a tabela OTA não cabe.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+# ota_0 + ota_1 de 1.94 MB cada (ver partitions.csv)
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_PARTITION_TABLE_OFFSET=0x8000
@@ -34,3 +38,23 @@ CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
 CONFIG_ESP_TLS_USING_MBEDTLS=y
+
+# ── OTA: rollback ─────────────────────────────────────────────────
+# Imagem nova boota em PENDING_VERIFY; o app só se marca válido após o
+# autoteste local. Panic/watchdog/reset antes disso → bootloader volta
+# para a imagem anterior.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# ── OTA: imagens assinadas (RSA-3072, sem Secure Boot / sem eFuse) ─
+# esp_ota_end() rejeita binário sem assinatura válida da chave usada no
+# firmware em execução. Assinatura feita fora do build (chave fora do Git):
+# tools/flash_device.py e tools/publish_firmware.py chamam espsecure.
+CONFIG_SECURE_SIGNED_APPS_NO_SECURE_BOOT=y
+CONFIG_SECURE_SIGNED_APPS_RSA_SCHEME=y
+CONFIG_SECURE_SIGNED_ON_UPDATE_NO_SECURE_BOOT=y
+# CONFIG_SECURE_BOOT_BUILD_SIGNED_BINARIES is not set
+
+# ── Watchdogs (travamento → panic → reboot → rollback se pendente) ─
+CONFIG_ESP_TASK_WDT_PANIC=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=15
+CONFIG_BOOTLOADER_WDT_ENABLE=y
