@@ -1,46 +1,84 @@
 # ClaudeMeter — deploy no JimmyLab (Raspberry Pi 5, ARM64)
 #
-#   https://watch.jimmylab.com.br → Cloudflare Tunnel "jimmylab" → cloudflared → [proxy] → claude-meter:8000
+#   https://watch.jimmylab.com.br → Cloudflare Tunnel "jimmylab" → cloudflared → [proxy] → watch:80
+#                                                                   watch → [interna] → claude-meter:8000
 #
 # Diretório no servidor: /docker/apps/claude-meter   (clone deste repositório)
-# Rede "proxy" é externa e já existe — não é criada aqui. Nenhuma porta é publicada no host.
+# Rede "proxy" é externa e já existe. Nenhuma porta é publicada no host.
+# Só o gateway "watch" fica na rede proxy; a API não é alcançável pelo cloudflared.
 # Admin (cookies/refresh/balance): docker exec -i claude-meter python admin.py ...
+# Firmware OTA: ./ota (manifest.json + claudemeter-X.Y.Z.bin), publicado por tools/publish_firmware.py
 
 name: claude-meter
 
 networks:
   proxy:
     external: true
+  internal:
+    name: claude-meter-internal
+
+x-hardening: &hardening
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
 
 services:
+  watch:
+    <<: *hardening
+    image: nginxinc/nginx-unprivileged:1.29-alpine
+    container_name: watch
+    # nginx sem root escutando na 80 dentro do próprio namespace de rede
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: "80"
+    read_only: true
+    tmpfs:
+      - /tmp
+    environment:
+      TZ: ${TZ:-America/Porto_Velho}
+    volumes:
+      - ./watch/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./ota:/srv/firmware:ro
+    networks:
+      - proxy
+      - internal
+    depends_on:
+      claude-meter:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
   claude-meter:
+    <<: *hardening
     build:
       context: ./proxy
     image: claude-meter:latest
     container_name: claude-meter
-    restart: unless-stopped
+    # Dono de ./data no host (jimmycl = 1001)
+    user: "${PUID:-1001}:${PGID:-1001}"
     env_file: .env
     environment:
       PYTHONUNBUFFERED: "1"
       DATA_DIR: /data
       TZ: ${TZ:-America/Porto_Velho}
     volumes:
-      # claude_cookies.json — sessão do claude.ai, tratar como secret (dono UID 1000)
+      # claude_cookies.json — sessão do claude.ai, tratar como secret
       - ./data:/data
     networks:
-      - proxy
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
+      - internal
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 15s
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"

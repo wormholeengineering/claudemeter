@@ -13,6 +13,11 @@ firmware/main/secrets.h
 secrets.h
 *service-token*
 *service_token*
+# Chave privada de assinatura do firmware (RSA-3072) — backup offline, nunca no repo
+*.pem
+*signing*key*
+# Binários/manifest de OTA publicados no servidor
+ota/
 
 # ── Firmware build artifacts ──────────────────────────────────────
 firmware/build/
