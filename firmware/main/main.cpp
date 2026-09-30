@@ -35,6 +35,7 @@
 #include "esp_lvgl_port.h"
 
 #include "app_config.h"   // URLs, intervalos e secrets.h
+#include "heap_log.h"
 #include "ota.h"
 #include "watch_http.h"
 #include "wifi_mgr.h"
@@ -590,6 +591,11 @@ static void fetch_task(void *) {
 
     while (true) {
         g_last_fetch_ok = fetch_usage();
+        char where[96];
+        snprintf(where, sizeof(where), "/usage %s | %s %s",
+                 g_last_fetch_ok ? "OK" : "falhou",
+                 esp_app_get_description()->version, ota_running_summary());
+        heap_log(TAG, where);
 
         if (lvgl_port_lock(100)) {
             ui_update();
@@ -844,5 +850,7 @@ extern "C" void app_main() {
 
     xTaskCreate(selftest_task, "selftest", 4096, nullptr, 2, nullptr);
 
-    ESP_LOGI(TAG, "ClaudeMeter %s iniciado", esp_app_get_description()->version);
+    ESP_LOGI(TAG, "ClaudeMeter %s iniciado (%s)", esp_app_get_description()->version,
+             ota_running_summary());
+    heap_log(TAG, "após init");
 }

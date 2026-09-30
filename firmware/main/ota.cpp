@@ -17,6 +17,7 @@
 #include "mbedtls/sha256.h"
 
 #include "app_config.h"
+#include "heap_log.h"
 #include "watch_http.h"
 
 static const char *TAG = "ota";
@@ -212,6 +213,9 @@ static bool download_and_install(const manifest_t *m) {
     char url[sizeof(WATCH_BASE_URL) + sizeof(m->path)];
     snprintf(url, sizeof(url), "%s%s", WATCH_BASE_URL, m->path);
 
+    ESP_LOGI(TAG, "gravando em %s (0x%lx, %lu B)", part->label,
+             (unsigned long)part->address, (unsigned long)part->size);
+
     esp_http_client_handle_t c = watch_http_client(url);
     if (!c) return false;
 
@@ -258,6 +262,7 @@ static bool download_and_install(const manifest_t *m) {
             ESP_LOGW(TAG, "download interrompido (%d/%d B)", total, m->size);
             break;
         }
+        ESP_LOGI(TAG, "download completo: %d B", total);
 
         // 1) SHA-256 do arquivo inteiro == manifest
         uint8_t digest[32];
@@ -268,11 +273,13 @@ static bool download_and_install(const manifest_t *m) {
             ESP_LOGE(TAG, "SHA-256 diverge do manifest");
             break;
         }
+        ESP_LOGI(TAG, "SHA-256 confere com o manifest");
 
         // 2) esp_ota_end valida a imagem (checksum, hash embutido, assinatura RSA)
         ota_open = false;
         err = esp_ota_end(ota);
         if (err != ESP_OK) { ESP_LOGE(TAG, "imagem rejeitada: %s", esp_err_to_name(err)); break; }
+        ESP_LOGI(TAG, "imagem validada por esp_ota_end (assinatura RSA OK)");
 
         // 3) descrição da imagem gravada == manifest
         esp_app_desc_t desc;
@@ -282,9 +289,11 @@ static bool download_and_install(const manifest_t *m) {
             ESP_LOGE(TAG, "esp_app_desc não confere com o manifest");
             break;
         }
+        ESP_LOGI(TAG, "esp_app_desc confere: %s %s", desc.project_name, desc.version);
 
         err = esp_ota_set_boot_partition(part);
         if (err != ESP_OK) { ESP_LOGE(TAG, "set_boot_partition: %s", esp_err_to_name(err)); break; }
+        ESP_LOGI(TAG, "partição de boot → %s", part->label);
         ok = true;
     } while (false);
 
@@ -327,8 +336,11 @@ static check_result_t ota_check_once() {
         }
 
         ESP_LOGI(TAG, "atualizando %s → %s (%d B)", running, m.version, m.size);
+        heap_log(TAG, "antes do OTA");
         status("UPDATE 0%");
-        if (download_and_install(&m)) {
+        bool installed = download_and_install(&m);
+        heap_log(TAG, installed ? "OTA concluído" : "OTA falhou");
+        if (installed) {
             status("UPDATE OK");
             ESP_LOGI(TAG, "reiniciando na versão %s", m.version);
             vTaskDelay(pdMS_TO_TICKS(1500));
@@ -353,6 +365,24 @@ static void ota_task(void *) {
         }
         vTaskDelay(pdMS_TO_TICKS((uint32_t)delay_s * 1000));
     }
+}
+
+const char *ota_running_summary() {
+    static char buf[40];
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t st;
+    const char *state = "?";
+    if (esp_ota_get_state_partition(running, &st) == ESP_OK) {
+        state = st == ESP_OTA_IMG_VALID          ? "VALID"          :
+                st == ESP_OTA_IMG_PENDING_VERIFY ? "PENDING_VERIFY" :
+                st == ESP_OTA_IMG_UNDEFINED      ? "UNDEFINED"      :
+                st == ESP_OTA_IMG_NEW            ? "NEW"            :
+                st == ESP_OTA_IMG_INVALID        ? "INVALID"        : "ABORTED";
+    } else {
+        state = "sem otadata";
+    }
+    snprintf(buf, sizeof(buf), "%s %s", running->label, state);
+    return buf;
 }
 
 void ota_start(const ota_hooks_t *hooks) {

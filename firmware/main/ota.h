@@ -29,3 +29,6 @@ void ota_selftest_result(bool healthy, const char *reason);
 
 // Inicia a verificação periódica do manifest (após o autoteste).
 void ota_start(const ota_hooks_t *hooks);
+
+// "ota_1 VALID" etc. — partição em execução e estado OTA, para logs.
+const char *ota_running_summary();
