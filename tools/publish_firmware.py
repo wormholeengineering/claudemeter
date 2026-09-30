@@ -10,6 +10,11 @@ Publica uma versão de firmware para FOTA em watch.jimmylab.com.br/firmware/.
 - Envia primeiro o .bin e só depois o manifest, cada um como .tmp + mv
   (atômico): o dispositivo nunca vê manifest apontando para .bin ausente.
 - Binários são imutáveis: aborta se já existir o mesmo nome com outro hash.
+
+Em duas etapas (validar o .bin pelo watch antes de expor o manifest):
+    --step bin       assina, gera o manifest local e envia só o .bin
+    --step manifest  reusa o .bin já assinado (sem reassinar: a assinatura
+                     RSA-PSS é aleatória) e publica o manifest por último
 """
 
 import argparse
@@ -18,8 +23,8 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fw_common import (BUILD, PROJECT, die, run, semver, sha256, sign_app,
-                       signing_key_arg, version_txt)
+from fw_common import (BUILD, PROJECT, app_desc, die, espsecure, run, semver,
+                       sha256, sign_app, signing_key_arg, version_txt)
 
 REMOTE_DIR = "/docker/apps/claude-meter/ota"
 
@@ -50,13 +55,24 @@ def main() -> None:
     ap.add_argument("--identity", help="chave SSH (ex.: ~/.ssh/aria_pi)")
     ap.add_argument("--remote-dir", default=REMOTE_DIR)
     ap.add_argument("--dry-run", action="store_true", help="só gera arquivos locais")
+    ap.add_argument("--step", choices=["all", "bin", "manifest"], default="all")
     args = ap.parse_args()
 
     key = signing_key_arg(args.key)
     ver = version_txt()
     name = f"{PROJECT}-{ver}.bin"
     out_dir = BUILD / "ota"
-    signed = sign_app(key, out_dir / name)
+    signed = out_dir / name
+    if args.step == "manifest":
+        # Reusa o binário já enviado: mesma assinatura, mesmo hash
+        if not signed.is_file():
+            die(f"{signed} não existe — rode antes --step bin")
+        desc = app_desc(signed)
+        if desc["project"] != PROJECT or desc["version"] != ver:
+            die(f"{signed.name} é {desc['project']} {desc['version']}, esperado {ver}")
+        run(espsecure("verify_signature", "--version", "2", "--keyfile", key, signed))
+    else:
+        signed = sign_app(key, signed)
     digest = sha256(signed)
 
     manifest = {
@@ -89,11 +105,18 @@ def main() -> None:
     if chk.returncode == 0 and chk.stdout.split():
         if chk.stdout.split()[0] != digest:
             die(f"{name} já existe no servidor com outro conteúdo")
-        print(f"{name} já publicado com o mesmo hash — reenviando só o manifest")
+        print(f"{name} já está no servidor com o mesmo hash")
+    elif args.step == "manifest":
+        die(f"{name} não está no servidor — rode antes --step bin")
     else:
         run(ssh_base(args) + [f"mkdir -p {rdir}"])
         run(scp_base(args) + [signed, f"{args.ssh}:{rdir}/.{name}.tmp"])
         run(ssh_base(args) + [f"chmod 644 {rdir}/.{name}.tmp && mv {rdir}/.{name}.tmp {rdir}/{name}"])
+
+    if args.step == "bin":
+        print(f"\n.bin enviado ({signed.stat().st_size} B, sha256 {digest[:16]}…); "
+              "manifest NÃO publicado — valide e rode --step manifest")
+        return
 
     run(scp_base(args) + [manifest_path, f"{args.ssh}:{rdir}/.manifest.json.tmp"])
     run(ssh_base(args) + [f"chmod 644 {rdir}/.manifest.json.tmp && "
