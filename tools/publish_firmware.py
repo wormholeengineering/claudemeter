@@ -23,7 +23,8 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fw_common import (BUILD, PROJECT, app_desc, die, espsecure, run, semver,
+import fw_common as fw
+from fw_common import (PROJECT, app_desc, die, espsecure, run, semver,
                        sha256, sign_app, signing_key_arg, version_txt)
 
 REMOTE_DIR = "/docker/apps/claude-meter/ota"
@@ -56,12 +57,16 @@ def main() -> None:
     ap.add_argument("--remote-dir", default=REMOTE_DIR)
     ap.add_argument("--dry-run", action="store_true", help="só gera arquivos locais")
     ap.add_argument("--step", choices=["all", "bin", "manifest"], default="all")
+    ap.add_argument("--build-dir", default="build", help="subdiretório de firmware/ (padrão: build)")
+    ap.add_argument("--allow-rollback-test", action="store_true",
+                    help="permite publicar um ROLLBACK TEST BUILD (teste controlado)")
     args = ap.parse_args()
+    fw.set_build_dir(args.build_dir)
 
     key = signing_key_arg(args.key)
     ver = version_txt()
     name = f"{PROJECT}-{ver}.bin"
-    out_dir = BUILD / "ota"
+    out_dir = fw.BUILD / "ota"
     signed = out_dir / name
     if args.step == "manifest":
         # Reusa o binário já enviado: mesma assinatura, mesmo hash
@@ -74,6 +79,11 @@ def main() -> None:
     else:
         signed = sign_app(key, signed)
     digest = sha256(signed)
+
+    if fw.is_rollback_test(signed):
+        if not args.allow_rollback_test:
+            die("imagem é um ROLLBACK TEST BUILD — use --allow-rollback-test para publicá-la")
+        print("\n*** ATENÇÃO: publicando ROLLBACK TEST BUILD (reprova o autoteste) ***\n")
 
     manifest = {
         "project": PROJECT,

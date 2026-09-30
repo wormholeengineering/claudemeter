@@ -16,8 +16,8 @@ import argparse
 import re
 import sys
 
-from fw_common import (BUILD, die, esptool, run, sign_app, signing_key_arg,
-                       version_txt)
+import fw_common as fw
+from fw_common import die, esptool, run, sign_app, signing_key_arg, version_txt
 
 REQUIRED_FLASH = "4MB"
 
@@ -29,7 +29,7 @@ def detect_flash_size(output: str) -> str | None:
 
 def flash_plan(signed_app) -> tuple[list[str], list[str]]:
     """Lê build/flash_args e troca o app pelo binário assinado."""
-    lines = (BUILD / "flash_args").read_text(encoding="utf-8").split("\n")
+    lines = (fw.BUILD / "flash_args").read_text(encoding="utf-8").split("\n")
     opts = lines[0].split()
     pairs: list[str] = []
     for line in lines[1:]:
@@ -39,7 +39,7 @@ def flash_plan(signed_app) -> tuple[list[str], list[str]]:
         if path == "claudemeter.bin":
             pairs += [addr, str(signed_app)]
         else:
-            pairs += [addr, str(BUILD / path)]
+            pairs += [addr, str(fw.BUILD / path)]
     return opts, pairs
 
 
@@ -53,6 +53,8 @@ def main() -> None:
     args = ap.parse_args()
 
     key = signing_key_arg(args.key)
+    if fw.APP_BIN.is_file() and fw.is_rollback_test(fw.APP_BIN):
+        die("build/claudemeter.bin é um ROLLBACK TEST BUILD — não gravar por USB")
 
     # 1) Confirmação física da flash — condição para tudo o que segue
     out = run(esptool("--chip", "esp32c3", "--port", args.port, "flash_id"), capture=True)
@@ -68,7 +70,7 @@ def main() -> None:
 
     # 2) App assinado
     ver = version_txt()
-    signed = sign_app(key, BUILD / "signed" / f"claudemeter-{ver}.bin")
+    signed = sign_app(key, fw.BUILD / "signed" / f"claudemeter-{ver}.bin")
     opts, pairs = flash_plan(signed)
 
     cmd = esptool("--chip", "esp32c3", "--port", args.port, "-b", "460800",

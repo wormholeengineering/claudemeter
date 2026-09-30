@@ -742,6 +742,15 @@ static void selftest_task(void *) {
                          !lvgl_alive               ? "LVGL parado"    : "";
     bool healthy = reason[0] == '\0';
 
+#ifdef ROLLBACK_TEST_BUILD
+    // Build de teste (-DROLLBACK_TEST_BUILD=1): tudo iniciou, mas o autoteste
+    // é reprovado de propósito para exercitar o rollback. Produção não compila isto.
+    if (healthy) reason = "ROLLBACK TEST BUILD (reprovacao proposital)";
+    healthy = false;
+    ESP_LOGW(TAG, "ROLLBACK TEST BUILD: autoteste reprovado de proposito; "
+                  "esp_ota_mark_app_valid_cancel_rollback() NAO sera chamado");
+#endif
+
     // Informativo apenas — indisponibilidade externa não rejeita a imagem
     ESP_LOGI(TAG, "autoteste: local=%s | wifi=%s | watch /usage=%s",
              healthy ? "OK" : reason, wifi_mgr_connected() ? "conectado" : "sem conexão",
@@ -852,5 +861,9 @@ extern "C" void app_main() {
 
     ESP_LOGI(TAG, "ClaudeMeter %s iniciado (%s)", esp_app_get_description()->version,
              ota_running_summary());
+#ifdef ROLLBACK_TEST_BUILD
+    ESP_LOGW(TAG, "*** ROLLBACK TEST BUILD %s (%s) — autoteste sera reprovado em %d s ***",
+             esp_app_get_description()->version, ota_running_summary(), SELFTEST_STABLE_SEC);
+#endif
     heap_log(TAG, "após init");
 }

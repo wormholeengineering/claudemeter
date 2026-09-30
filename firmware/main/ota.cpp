@@ -118,7 +118,8 @@ void ota_selftest_result(bool healthy, const char *reason) {
         return;
     }
 
-    ESP_LOGE(TAG, "autoteste FALHOU (%s) — rollback", reason);
+    ESP_LOGE(TAG, "autoteste FALHOU (%s) — rollback; imagem NÃO marcada válida", reason);
+    ESP_LOGW(TAG, "esp_ota_mark_app_invalid_rollback_and_reboot() — voltando à imagem anterior");
     esp_ota_mark_app_invalid_rollback_and_reboot();
     // Só retorna se não existir imagem anterior válida: segue rodando esta.
     ESP_LOGE(TAG, "sem imagem anterior para rollback — mantendo a atual");

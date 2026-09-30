@@ -21,6 +21,7 @@ ota/
 
 # ── Firmware build artifacts ──────────────────────────────────────
 firmware/build/
+firmware/build-*/
 firmware/managed_components/
 firmware/sdkconfig
 firmware/build_log.txt

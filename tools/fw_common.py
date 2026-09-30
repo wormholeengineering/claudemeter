@@ -18,6 +18,18 @@ FIRMWARE = REPO / "firmware"
 BUILD = FIRMWARE / "build"
 APP_BIN = BUILD / "claudemeter.bin"
 PROJECT = "claudemeter"
+ROLLBACK_TEST_MARKER = b"ROLLBACK TEST BUILD"
+
+
+def set_build_dir(name: str) -> None:
+    """Usa firmware/<name> (ex.: build-rollback-test) em vez de firmware/build."""
+    global BUILD, APP_BIN
+    BUILD = FIRMWARE / name
+    APP_BIN = BUILD / "claudemeter.bin"
+
+
+def is_rollback_test(path: Path) -> bool:
+    return ROLLBACK_TEST_MARKER in path.read_bytes()
 
 APP_DESC_MAGIC = 0xABCD5432
 SEMVER = re.compile(r"^\d+\.\d+\.\d+$")
