@@ -85,8 +85,11 @@ async def get_usage() -> JSONResponse:
             age = int(time.monotonic() - _cache.fetched_at)
             return JSONResponse({**_cache.data, "cache_age_secs": age})
 
-        log.info("Consultando claude.ai...")
+        log.info("Cache expirado — consultando claude.ai")
+        t0 = time.monotonic()
         usage = await fetch_claude_usage()
+        log.info("Consulta concluída: source=%s em %d ms", usage.get("source"),
+                 int((time.monotonic() - t0) * 1000))
 
         api_balance = usage.pop("extra_balance", -1.0)
         effective_balance = api_balance if api_balance >= 0 else _manual_balance
@@ -112,7 +115,7 @@ async def set_balance(body: BalanceUpdate) -> dict:
     """Atualiza saldo extra manualmente."""
     global _manual_balance
     _manual_balance = body.value
-    log.info("Saldo extra atualizado: %.2f", _manual_balance)
+    log.info("Saldo extra manual atualizado")
     return {"ok": True, "extra_balance": _manual_balance}
 
 

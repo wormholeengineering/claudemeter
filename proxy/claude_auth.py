@@ -16,12 +16,22 @@ Endpoints descobertos via HAR (claude.ai/settings/usage):
 import json
 import logging
 import os
+import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from curl_cffi.requests import AsyncSession as CurlSession
 
 log = logging.getLogger("claudemeter.auth")
+
+# Logs: nunca cookies, org_id, saldo, créditos ou percentuais em INFO.
+_UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+def _redact(text: str) -> str:
+    """Remove IDs (org_id etc.) de mensagens de erro/URLs antes de logar."""
+    return _UUID.sub("<id>", text)
 
 COOKIES_FILE = Path(os.environ.get("DATA_DIR", "/data")) / "claude_cookies.json"
 COOKIES_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -151,9 +161,11 @@ def _parse_credits_response(data: dict) -> float | None:
 # ── Requisição a um endpoint ──────────────────────────────────────────────────
 
 async def _get_json(client: CurlSession, url: str, label: str) -> dict | list | None:
+    t0 = time.monotonic()
     try:
         resp = await client.get(url, headers=BROWSER_HEADERS, allow_redirects=True)
-        log.info("[%s] %s → %d", label, url.split("?")[0], resp.status_code)
+        log.info("[%s] HTTP %d em %d ms", label, resp.status_code,
+                 int((time.monotonic() - t0) * 1000))
 
         if resp.status_code != 200:
             if resp.status_code in (401, 403):
@@ -167,7 +179,8 @@ async def _get_json(client: CurlSession, url: str, label: str) -> dict | list | 
 
         return data
     except Exception as e:
-        log.warning("[%s] Erro: %s", label, e)
+        log.warning("[%s] Erro após %d ms: %s: %s", label,
+                    int((time.monotonic() - t0) * 1000), type(e).__name__, _redact(str(e)))
         return None
 
 
@@ -203,8 +216,6 @@ async def fetch_claude_usage() -> dict:
     org_id = next(
         (c["value"] for c in cookies_list if c["name"] == "lastActiveOrg"), None
     )
-    log.info("org_id: %s", org_id)
-
     if not org_id:
         log.warning("Cookie 'lastActiveOrg' não encontrado — org_id desconhecido.")
         return {**empty, "source": "no-org-id"}
@@ -222,7 +233,7 @@ async def fetch_claude_usage() -> dict:
             parsed = _parse_usage_response(usage_data)
             if parsed:
                 result.update(parsed)
-                log.info("Dados de uso: %s", parsed)
+                log.info("[org-usage] dados recebidos (%d campos)", len(parsed))
             else:
                 log.warning("[org-usage] Resposta inesperada: %s", list(usage_data.keys()))
 
@@ -236,7 +247,7 @@ async def fetch_claude_usage() -> dict:
             balance = _parse_credits_response(credits_data)
             if balance is not None:
                 result["extra_balance"] = balance
-                log.info("Saldo pré-pago: R$%.2f", balance)
+                log.info("[prepaid-credits] saldo recebido")
 
         # Verifica se obteve dados úteis
         if result["session_pct"] >= 0 or result["weekly_pct"] >= 0:
